@@ -1,0 +1,10 @@
+.DS_Store
+*.pyc
+ignore
+.vscode/
+.claude/
+
+
+
+*__pycache__/
+/.claude/
