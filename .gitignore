@@ -1,0 +1,8 @@
+.DS_Store
+*.pyc
+ignore
+.vscode/
+
+
+
+*__pycache__/

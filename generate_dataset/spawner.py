@@ -2,6 +2,8 @@ import carla
 import random
 import math
 
+from utils import lerp_location
+
 
 def spawn_actor(world, bp, transform, max_attempts=10, attach_to=None):
     for _ in range(max_attempts):
@@ -139,8 +141,70 @@ def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_d
         world.tick()
     for v in spawned_vehicles:
         v.set_simulate_physics(False)
-       
+
     return spawned_vehicles
+
+
+def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
+                               crossing_start, crossing_end,
+                               progress=None, speed_range=(0.9, 1.6)):
+    """
+    Spawns a pedestrian on the crosswalk line between crossing_start and
+    crossing_end, walking toward the far side via CARLA's AI walker
+    controller (proper crowd-nav pathing + walk animation), so it reads as
+    genuinely crossing rather than standing still on the zebra crossing.
+
+    progress: 0..1 position along the line to start from. If None, a random
+    start near one side is chosen (so the walk has room to play out).
+    Returns (pedestrian, controller_or_None).
+    """
+    if progress is None:
+        progress = random.uniform(0.05, 0.35)
+
+    if random.random() < 0.5:
+        start_loc = lerp_location(crossing_start, crossing_end, progress)
+        target_loc = crossing_end
+        yaw = math.degrees(math.atan2(crossing_end.y - crossing_start.y, crossing_end.x - crossing_start.x))
+    else:
+        start_loc = lerp_location(crossing_end, crossing_start, progress)
+        target_loc = crossing_start
+        yaw = math.degrees(math.atan2(crossing_start.y - crossing_end.y, crossing_start.x - crossing_end.x))
+
+    spawn_transform = carla.Transform(
+        carla.Location(start_loc.x, start_loc.y, start_loc.z + 0.5),
+        carla.Rotation(yaw=yaw)
+    )
+
+    ped_bp = random.choice(pedestrian_bps)
+    if ped_bp.has_attribute('is_invincible'):
+        ped_bp.set_attribute('is_invincible', 'false')
+
+    pedestrian = spawn_actor(world, ped_bp, spawn_transform)
+    if not pedestrian:
+        return None, None
+
+    world.tick()
+
+    controller = None
+    speed = random.uniform(*speed_range)
+    try:
+        controller = world.spawn_actor(walker_controller_bp, carla.Transform(), attach_to=pedestrian)
+        world.tick()
+        controller.start()
+        beyond = lerp_location(start_loc, target_loc, 1.4)
+        controller.go_to_location(carla.Location(beyond.x, beyond.y, target_loc.z))
+        controller.set_max_speed(speed)
+    except RuntimeError:
+        if controller is not None and controller.is_alive:
+            controller.destroy()
+        controller = None
+        yaw_rad = math.radians(yaw)
+        control = carla.WalkerControl()
+        control.direction = carla.Vector3D(x=math.cos(yaw_rad), y=math.sin(yaw_rad))
+        control.speed = speed
+        pedestrian.apply_control(control)
+
+    return pedestrian, controller
 
 
 
