@@ -44,16 +44,9 @@ def get_world_corners(box):
     return world_corners
 
 
-# ============================================================
-# ✅ CORE FIX: Strict FOV + Depth Validation
-# ============================================================
+# projects 3D world vertices to 2D image plane, dropping anything behind
+# the camera plane so a bbox can't stretch across the whole frame
 def project_vertices_to_2d(verts, world_to_camera, K, image_w, image_h):
-    """
-    Projects 3D world vertices to 2D image plane.
-    Returns (points_2d, all_behind_camera)
-    - Filters out vertices behind the camera
-    - Tracks how many vertices are actually in front
-    """
     points_2d = []
     valid_depths = []
 
@@ -63,9 +56,8 @@ def project_vertices_to_2d(verts, world_to_camera, K, image_w, image_h):
         p_camera = np.dot(world_to_camera, world_point)
 
 
-        # p_camera[0] is forward depth in CARLA camera space
+        # p_camera[0] is forward depth in CARLA camera space; behind camera, skip
         if p_camera[0] <= 0:
-            # Vertex is BEHIND the camera — skip
             continue
 
 
@@ -94,18 +86,9 @@ def is_bbox_valid(x_min, y_min, x_max, y_max,
                   min_area=200,
                   max_area_ratio=0.85,
                   min_dim=10):
-    """
-    ✅ Strict bbox validation to eliminate ghost boxes.
-
-
-    Checks:
-    - bbox is within image bounds
-    - minimum area threshold (removes tiny noise boxes)
-    - maximum area ratio (removes full-frame ghost boxes)
-    - minimum width and height dimension
-    - aspect ratio sanity check
-    """
-    # Must overlap with image
+    # rejects boxes that don't overlap the frame, are too small to be real,
+    # cover almost the whole image (usually a bad projection), or have a
+    # silly aspect ratio
     if x_max <= 0 or y_max <= 0:
         return False
     if x_min >= image_w or y_min >= image_h:
@@ -125,17 +108,12 @@ def is_bbox_valid(x_min, y_min, x_max, y_max,
     image_area = image_w * image_h
 
 
-    # Too small — likely noise
     if area < min_area:
         return False
 
-
-    # ✅ KEY FIX: Too large — ghost box covering whole frame
     if area > max_area_ratio * image_area:
         return False
 
-
-    # Aspect ratio sanity: vehicles shouldn't be extremely thin
     aspect = w / (h + 1e-6)
     if aspect > 10.0 or aspect < 0.1:
         return False
@@ -162,10 +140,7 @@ def build_camera_intrinsics(camera):
 
 
 def is_visible_and_not_occluded(world, camera, actor_or_loc, max_distance):
-    """
-    Occlusion check using ray casting.
-    Works for both dynamic actors and static objects.
-    """
+    # raycast occlusion check, works for both a live actor and a bare location
     if hasattr(actor_or_loc, 'get_transform'):
         actor_loc = actor_or_loc.get_transform().location
     elif hasattr(actor_or_loc, 'transform'):
@@ -175,8 +150,8 @@ def is_visible_and_not_occluded(world, camera, actor_or_loc, max_distance):
 
 
     cam_loc = camera.get_transform().location
-   
-    # ✅ Elevate the ray target to prevent hitting the road/ground
+
+    # lift the ray target a bit so it doesn't clip the ground/road mesh
     ray_target = carla.Location(actor_loc.x, actor_loc.y, actor_loc.z + 0.8)
     dist = get_distance(cam_loc, ray_target)
 
@@ -197,25 +172,11 @@ def is_visible_and_not_occluded(world, camera, actor_or_loc, max_distance):
 
 
 
-# ============================================================
-# ✅ UNIFIED: Dynamic + Static Vehicle BBox Extraction
-# ============================================================
+# combines dynamic vehicle actors with static/parked environment vehicles
+# into one bbox list, with the same ghost-box filtering applied to both
 def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
                             min_area=200, check_occlusion=True,
                             min_vertices_in_front=2):
-    """
-    Returns bounding boxes for ALL vehicles:
-    - Dynamic actors (world.get_actors())
-    - Static environment objects (world.get_environment_objects())
-
-
-    Ghost box fixes applied:
-    - Minimum vertices in front of camera required
-    - Strict area + dimension validation
-    - Occlusion check
-    - Aspect ratio check
-    - Max area ratio check
-    """
     K, image_w, image_h = build_camera_intrinsics(camera)
     cam_transform = camera.get_transform()
     world_to_camera = np.array(cam_transform.get_inverse_matrix())
@@ -225,9 +186,7 @@ def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
     results = []
 
 
-    # ----------------------------------------------------------
-    # PART 1: Dynamic Vehicles
-    # ----------------------------------------------------------
+    # dynamic vehicles first
     dynamic_actors = world.get_actors().filter('vehicle.*')
 
 
@@ -257,31 +216,26 @@ def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
         )
 
 
-        # ✅ Ghost Fix: Require minimum vertices in front of camera
+        # need at least a couple vertices in front of the camera or the
+        # projection is garbage
         if len(points_2d) < min_vertices_in_front:
             continue
 
-
         points_2d = np.array(points_2d)
 
-
-        # ✅ Ghost Fix: Strictly filter objects completely outside image bounds BEFORE clipping
+        # skip anything that's fully off-frame before we clip it into a box
         if (np.max(points_2d[:, 0]) < 0 or np.min(points_2d[:, 0]) > image_w or
             np.max(points_2d[:, 1]) < 0 or np.min(points_2d[:, 1]) > image_h):
             continue
-
 
         x_min = int(np.clip(np.min(points_2d[:, 0]), 0, image_w))
         y_min = int(np.clip(np.min(points_2d[:, 1]), 0, image_h))
         x_max = int(np.clip(np.max(points_2d[:, 0]), 0, image_w))
         y_max = int(np.clip(np.max(points_2d[:, 1]), 0, image_h))
 
-
-        # ✅ Strict validation
         if not is_bbox_valid(x_min, y_min, x_max, y_max,
                               image_w, image_h, min_area=min_area):
             continue
-
 
         results.append({
             'bbox':     [x_min, y_min, x_max, y_max],
@@ -294,9 +248,7 @@ def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
         })
 
 
-    # ----------------------------------------------------------
-    # PART 2: Static / Environment Vehicles
-    # ----------------------------------------------------------
+    # then the static/parked vehicles baked into the map itself
     env_objects = []
     if hasattr(carla.CityObjectLabel, 'Vehicles'):
         env_objects.extend(world.get_environment_objects(carla.CityObjectLabel.Vehicles))
@@ -318,7 +270,8 @@ def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
             continue
 
 
-        # ✅ Extract absolute world center to prevent (0,0,0) transform bugs
+        # average the corners for the world center instead of trusting
+        # obj.transform, which is sometimes (0,0,0) for static map objects
         center_x = sum(v.x for v in verts) / len(verts)
         center_y = sum(v.y for v in verts) / len(verts)
         center_z = sum(v.z for v in verts) / len(verts)
@@ -344,31 +297,23 @@ def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
         )
 
 
-        # ✅ Ghost Fix: Require minimum vertices in front of camera
         if len(points_2d) < min_vertices_in_front:
             continue
 
-
         points_2d = np.array(points_2d)
 
-
-        # ✅ Ghost Fix: Strictly filter objects completely outside image bounds BEFORE clipping
         if (np.max(points_2d[:, 0]) < 0 or np.min(points_2d[:, 0]) > image_w or
             np.max(points_2d[:, 1]) < 0 or np.min(points_2d[:, 1]) > image_h):
             continue
-
 
         x_min = int(np.clip(np.min(points_2d[:, 0]), 0, image_w))
         y_min = int(np.clip(np.min(points_2d[:, 1]), 0, image_h))
         x_max = int(np.clip(np.max(points_2d[:, 0]), 0, image_w))
         y_max = int(np.clip(np.max(points_2d[:, 1]), 0, image_h))
 
-
-        # ✅ Strict validation
         if not is_bbox_valid(x_min, y_min, x_max, y_max,
                               image_w, image_h, min_area=min_area):
             continue
-
 
         results.append({
             'bbox':     [x_min, y_min, x_max, y_max],
@@ -430,7 +375,6 @@ def get_2d_bbox_from_3d(actor, camera):
     points_2d = np.array(points_2d)
 
 
-    # ✅ Ghost Fix: Ensure object intersects screen before bounding it to screen
     if (np.max(points_2d[:, 0]) < 0 or np.min(points_2d[:, 0]) > image_w or
         np.max(points_2d[:, 1]) < 0 or np.min(points_2d[:, 1]) > image_h):
         return None
@@ -610,9 +554,6 @@ def get_crosswalk_approach_transforms(carla_map,
     return valid_transforms
 
 
-# ============================================================
-# ✅ SCENARIO PIPELINE: crosswalk-to-crosswalk crossing + occlusion targeting
-# ============================================================
 def lerp_location(a, b, t):
     return carla.Location(
         x=a.x + (b.x - a.x) * t,
@@ -776,10 +717,7 @@ def find_best_occlusion_transform(pedestrian_bb, crossing_start, crossing_end,
 
 
 def get_actor_label_for_scenario(actor, truck_ids, cyclist_ids, escooter_ids, separate_truck_class=True):
-    """
-    Scenario-pipeline label resolver: distinguishes Cyclist / E-Scooter+Rider
-    / Truck (togglable) / Vehicle / Pedestrian by blueprint id.
-    """
+    # sorts an actor into Pedestrian / Cyclist / E-Scooter+Rider / Truck / Vehicle by blueprint id
     if hasattr(actor, 'type_id'):
         if 'walker.pedestrian' in actor.type_id:
             return 'Pedestrian'
@@ -796,4 +734,165 @@ def get_actor_label_for_scenario(actor, truck_ids, cyclist_ids, escooter_ids, se
         if type_name in ['Vehicles', 'Car', 'Truck', 'Bus', 'Motorcycle', 'Bicycle']:
             return 'Vehicle'
     return 'Actor'
+
+
+def should_use_lights(weather_params):
+    # reads straight off the weather object instead of matching a name
+    # string, so a brand new custom weather still gets sensible headlights
+    # without anyone having to register it anywhere
+    return (weather_params.cloudiness > 40 or weather_params.precipitation > 0
+            or weather_params.fog_density > 5 or weather_params.sun_altitude_angle < 30)
+
+
+def lane_right_vector(waypoint):
+    # unit vector pointing to the right of travel, for lateral offsets that
+    # stay parallel to the lane instead of drifting the car sideways off it
+    yaw_rad = math.radians(waypoint.transform.rotation.yaw)
+    forward_x, forward_y = math.cos(yaw_rad), math.sin(yaw_rad)
+    return -forward_y, forward_x
+
+
+def jitter_along_lane(waypoint, lateral_jitter=0.0, forward_jitter=0.0):
+    right_x, right_y = lane_right_vector(waypoint)
+    yaw_rad = math.radians(waypoint.transform.rotation.yaw)
+    forward_x, forward_y = math.cos(yaw_rad), math.sin(yaw_rad)
+    loc = waypoint.transform.location
+    return carla.Location(
+        x=loc.x + right_x * lateral_jitter + forward_x * forward_jitter,
+        y=loc.y + right_y * lateral_jitter + forward_y * forward_jitter,
+        z=loc.z
+    )
+
+
+def find_lane_waypoint(carla_map, loc, prefer_bike_lane=False):
+    # tries a dedicated bike lane first when asked for one, falls back to
+    # the ordinary driving lane if the map doesn't have one there
+    if prefer_bike_lane:
+        bike_wp = carla_map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Biking)
+        if bike_wp:
+            return bike_wp
+    return carla_map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+
+
+def get_crosswalk_centers(carla_map):
+    centers = []
+    current_polygon = []
+    for point in carla_map.get_crosswalks():
+        current_polygon.append(point)
+        if len(current_polygon) > 2 and point == current_polygon[0]:
+            corners = current_polygon[:-1]
+            if corners:
+                centers.append(carla.Location(
+                    x=sum(p.x for p in corners) / len(corners),
+                    y=sum(p.y for p in corners) / len(corners),
+                    z=sum(p.z for p in corners) / len(corners)
+                ))
+            current_polygon = []
+    return centers
+
+
+def is_far_from_all_crosswalks(loc, crosswalk_centers, min_dist):
+    for c in crosswalk_centers:
+        if get_distance(loc, c) < min_dist:
+            return False
+    return True
+
+
+def find_jaywalk_waypoint(carla_map, spawn_points, crosswalk_centers, exclusion_radius, max_attempts=40):
+    # a jaywalk shot is only valid if there's genuinely no crosswalk anywhere
+    # near enough to show up in frame - otherwise it just looks like someone
+    # ignoring a crossing right next to them, which isn't the point
+    for _ in range(max_attempts):
+        candidate = random.choice(spawn_points)
+        if is_far_from_all_crosswalks(candidate.location, crosswalk_centers, exclusion_radius):
+            wp = carla_map.get_waypoint(candidate.location, project_to_road=True, lane_type=carla.LaneType.Driving)
+            if wp:
+                return wp
+    return None
+
+
+def get_full_road_crossing_segment(waypoint, shoulder_margin=1.5, max_lanes_each_side=6):
+    # walks outward through adjacent driving lanes to find the true edge of
+    # the road on both sides, so a jaywalker crosses the whole street rather
+    # than just drifting inside one lane
+    right_x, right_y = lane_right_vector(waypoint)
+    loc = waypoint.transform.location
+
+    left_extent = waypoint.lane_width / 2.0
+    curr = waypoint.get_left_lane()
+    count = 0
+    while curr is not None and curr.lane_type == carla.LaneType.Driving and count < max_lanes_each_side:
+        left_extent += curr.lane_width
+        curr = curr.get_left_lane()
+        count += 1
+
+    right_extent = waypoint.lane_width / 2.0
+    curr = waypoint.get_right_lane()
+    count = 0
+    while curr is not None and curr.lane_type == carla.LaneType.Driving and count < max_lanes_each_side:
+        right_extent += curr.lane_width
+        curr = curr.get_right_lane()
+        count += 1
+
+    start = carla.Location(
+        x=loc.x - right_x * (left_extent + shoulder_margin),
+        y=loc.y - right_y * (left_extent + shoulder_margin),
+        z=loc.z
+    )
+    end = carla.Location(
+        x=loc.x + right_x * (right_extent + shoulder_margin),
+        y=loc.y + right_y * (right_extent + shoulder_margin),
+        z=loc.z
+    )
+    return start, end
+
+
+def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestrian=True, max_rerolls=8):
+    """
+    Rolls actor counts within a scenario's (min, max) ranges, re-rolling
+    until pedestrians are present and at least min_optional_satisfied of
+    {vehicles, cyclists_scooters, trucks, occlusion target} are also
+    nonzero - gives images real variety without letting them go completely
+    empty/boring. If we run out of rerolls we just bump the best attempt
+    up to clear the bar instead of giving up.
+    """
+    def roll(key):
+        lo, hi = scenario[key]
+        return random.randint(lo, hi)
+
+    def count_satisfied(counts):
+        return sum([
+            counts['vehicles'] > 0,
+            counts['cyclists_scooters'] > 0,
+            counts['trucks'] > 0,
+            scenario.get('occlusion_percent', 0) > 0,
+        ])
+
+    best_counts = None
+    for _ in range(max_rerolls):
+        counts = {
+            'pedestrians': roll('pedestrians'),
+            'vehicles': roll('vehicles'),
+            'cyclists_scooters': roll('cyclists_scooters'),
+            'trucks': roll('trucks'),
+        }
+        if require_pedestrian and counts['pedestrians'] < 1:
+            continue
+        if count_satisfied(counts) >= min_optional_satisfied:
+            return counts
+        if best_counts is None:
+            best_counts = counts
+
+    counts = best_counts or {'pedestrians': 1, 'vehicles': 0, 'cyclists_scooters': 0, 'trucks': 0}
+    if require_pedestrian and counts['pedestrians'] < 1:
+        counts['pedestrians'] = 1
+
+    for key in ['vehicles', 'cyclists_scooters', 'trucks']:
+        if count_satisfied(counts) >= min_optional_satisfied:
+            break
+        lo, hi = scenario[key]
+        if hi > 0:
+            counts[key] = max(counts[key], 1)
+
+    return counts
 

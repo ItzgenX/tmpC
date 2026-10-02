@@ -2,7 +2,7 @@ import carla
 import random
 import math
 
-from utils import lerp_location
+from utils import lerp_location, find_lane_waypoint, jitter_along_lane
 
 
 def spawn_actor(world, bp, transform, max_attempts=10, attach_to=None):
@@ -105,37 +105,54 @@ def spawn_pedestrian_on_sidewalk(world, pedestrian_bps, ego_transform, min_dist,
     return None, None
 
 
-def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_dist, max_dist, lateral_range, current_weather, allowed_vehicles):
+def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_dist, max_dist,
+                            lateral_range, lights_on, allowed_vehicles,
+                            prefer_bike_lane=False, keep_away_from=None, keep_away_dist=0.0,
+                            min_spacing=3.5, max_attempts=20):
     carla_map = world.get_map()
     spawned_vehicles = []
-    max_attempts = 20
-   
+
     traffic_bps = [bp for bp in blueprints.filter('vehicle.*') if bp.id in allowed_vehicles]
     if not traffic_bps:
-        print("Warning: No valid traffic vehicle blueprints found.")
+        print("no valid blueprints found for this category, skipping")
         return []
 
+    keep_away_from = keep_away_from or []
+
+    def too_close(loc):
+        for other in spawned_vehicles:
+            if loc.distance(other.get_transform().location) < min_spacing:
+                return True
+        for other in keep_away_from:
+            if other and other.is_alive and loc.distance(other.get_transform().location) < keep_away_dist:
+                return True
+        return False
 
     for _ in range(num_vehicles):
         for _ in range(max_attempts):
             loc = random_location_in_camera_fov(ego_transform, min_dist=min_dist, max_dist=max_dist, lateral_range=lateral_range)
-            wp = carla_map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Driving)
-            if wp:
-                t = wp.transform
-                t.location.z += 0.5
-                t.location.x += random.uniform(-1.0, 1.0)
-                t.location.y += random.uniform(-1.0, 1.0)
-                v_bp = random.choice(traffic_bps)
-                v_actor = spawn_actor(world, v_bp, t)
-                if v_actor:
-                    if current_weather in ["Partly_cloudy", "Overcast", "Rain"]:
-                        try:
-                            v_actor.set_light_state(carla.VehicleLightState(carla.VehicleLightState.Position | carla.VehicleLightState.LowBeam))
-                        except Exception:
-                            pass
-                    spawned_vehicles.append(v_actor)
-                    break
+            wp = find_lane_waypoint(carla_map, loc, prefer_bike_lane=prefer_bike_lane)
+            if not wp:
+                continue
 
+            # jitter along the lane's own right-vector so we stay parallel
+            # to the road instead of clipping sideways off it on a curve
+            candidate_loc = jitter_along_lane(wp, lateral_jitter=random.uniform(-0.4, 0.4))
+            candidate_loc.z += 0.5
+            if too_close(candidate_loc):
+                continue
+
+            t = carla.Transform(candidate_loc, wp.transform.rotation)
+            v_bp = random.choice(traffic_bps)
+            v_actor = spawn_actor(world, v_bp, t)
+            if v_actor:
+                if lights_on:
+                    try:
+                        v_actor.set_light_state(carla.VehicleLightState(carla.VehicleLightState.Position | carla.VehicleLightState.LowBeam))
+                    except Exception:
+                        pass
+                spawned_vehicles.append(v_actor)
+                break
 
     for _ in range(15):
         world.tick()
@@ -148,16 +165,13 @@ def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_d
 def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
                                crossing_start, crossing_end,
                                progress=None, speed_range=(0.9, 1.6)):
-    """
-    Spawns a pedestrian on the crosswalk line between crossing_start and
-    crossing_end, walking toward the far side via CARLA's AI walker
-    controller (proper crowd-nav pathing + walk animation), so it reads as
-    genuinely crossing rather than standing still on the zebra crossing.
-
-    progress: 0..1 position along the line to start from. If None, a random
-    start near one side is chosen (so the walk has room to play out).
-    Returns (pedestrian, controller_or_None).
-    """
+    # walks a pedestrian along crossing_start -> crossing_end (or the
+    # reverse) using CARLA's AI walker controller so it's an actual walk
+    # cycle toward the far side, not just standing there. works the same
+    # whether the line comes from a crosswalk polygon or a plain road width
+    # (jaywalk case), since it's just two points either way.
+    # progress is where along the line to start (0..1); random near one
+    # end by default so there's room left to walk before the capture.
     if progress is None:
         progress = random.uniform(0.05, 0.35)
 
