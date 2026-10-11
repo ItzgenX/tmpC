@@ -622,118 +622,10 @@ def get_crosswalk_crossing_segments(carla_map, ego_min_dist=5.0, ego_max_dist=12
     return segments
 
 
-def project_bbox_for_transform(bounding_box, transform, camera):
-    """
-    Projects an arbitrary (bounding_box, transform) pair to a 2D image-space
-    bbox without needing the actor to actually be at that transform yet.
-    """
-    K, image_w, image_h = build_camera_intrinsics(camera)
-    cam_transform = camera.get_transform()
-    world_to_camera = np.array(cam_transform.get_inverse_matrix())
-
-    verts = bounding_box.get_world_vertices(transform)
-    points_2d, _ = project_vertices_to_2d(verts, world_to_camera, K, image_w, image_h)
-
-    if len(points_2d) < 2:
-        return None
-
-    points_2d = np.array(points_2d)
-    if (np.max(points_2d[:, 0]) < 0 or np.min(points_2d[:, 0]) > image_w or
-        np.max(points_2d[:, 1]) < 0 or np.min(points_2d[:, 1]) > image_h):
-        return None
-
-    x_min = float(np.clip(np.min(points_2d[:, 0]), 0, image_w))
-    y_min = float(np.clip(np.min(points_2d[:, 1]), 0, image_h))
-    x_max = float(np.clip(np.max(points_2d[:, 0]), 0, image_w))
-    y_max = float(np.clip(np.max(points_2d[:, 1]), 0, image_h))
-    return [x_min, y_min, x_max, y_max]
-
-
-def compute_bbox_overlap_fraction(target_bbox, occluder_bboxes, grid=64):
-    """
-    Fraction of target_bbox's area covered by the union of occluder_bboxes,
-    approximated on a grid so multiple overlapping occluders are handled
-    correctly (rasterized union, not naive sum of individual overlaps).
-    """
-    tx0, ty0, tx1, ty1 = target_bbox
-    tw, th = tx1 - tx0, ty1 - ty0
-    if tw <= 0 or th <= 0:
-        return 0.0
-
-    covered = np.zeros((grid, grid), dtype=bool)
-    for (ox0, oy0, ox1, oy1) in occluder_bboxes:
-        gx0 = int(np.clip((ox0 - tx0) / tw * grid, 0, grid))
-        gx1 = int(np.clip((ox1 - tx0) / tw * grid, 0, grid))
-        gy0 = int(np.clip((oy0 - ty0) / th * grid, 0, grid))
-        gy1 = int(np.clip((oy1 - ty0) / th * grid, 0, grid))
-        if gx1 > gx0 and gy1 > gy0:
-            covered[gy0:gy1, gx0:gx1] = True
-
-    return float(covered.sum()) / float(grid * grid)
-
-
-def find_best_occlusion_transform(pedestrian_bb, crossing_start, crossing_end,
-                                   occluder_actors, camera, target_percent,
-                                   samples=25, progress_range=(0.15, 0.85)):
-    """
-    Searches along the crosswalk line for the pedestrian position whose
-    projected bbox overlap with the (already-placed) occluder_actors best
-    matches target_percent. Returns (transform, achieved_percent, progress_t)
-    or None if nothing projects into frame.
-    """
-    best = None
-    best_diff = None
-    lo, hi = progress_range
-
-    occluder_bboxes_cache = []
-    for occ in occluder_actors:
-        bbox = project_bbox_for_transform(occ.bounding_box, occ.get_transform(), camera)
-        if bbox:
-            occluder_bboxes_cache.append(bbox)
-
-    if not occluder_bboxes_cache:
-        return None
-
-    for i in range(samples):
-        t = lo + (hi - lo) * (i / max(1, samples - 1))
-        loc = lerp_location(crossing_start, crossing_end, t)
-        yaw = math.degrees(math.atan2(crossing_end.y - crossing_start.y, crossing_end.x - crossing_start.x))
-        candidate_transform = carla.Transform(
-            carla.Location(loc.x, loc.y, loc.z + 0.9),
-            carla.Rotation(yaw=yaw)
-        )
-
-        ped_bbox = project_bbox_for_transform(pedestrian_bb, candidate_transform, camera)
-        if not ped_bbox:
-            continue
-
-        overlap_pct = compute_bbox_overlap_fraction(ped_bbox, occluder_bboxes_cache) * 100.0
-        diff = abs(overlap_pct - target_percent)
-        if best_diff is None or diff < best_diff:
-            best_diff = diff
-            best = (candidate_transform, overlap_pct, t)
-
-    return best
-
-
-def get_actor_label_for_scenario(actor, truck_ids, cyclist_ids, escooter_ids, separate_truck_class=True):
-    # sorts an actor into Pedestrian / Cyclist / E-Scooter+Rider / Truck / Vehicle by blueprint id
-    if hasattr(actor, 'type_id'):
-        if 'walker.pedestrian' in actor.type_id:
-            return 'Pedestrian'
-        if actor.type_id in escooter_ids:
-            return 'E-Scooter + Rider'
-        if actor.type_id in cyclist_ids:
-            return 'Cyclist'
-        if actor.type_id in truck_ids:
-            return 'Truck' if separate_truck_class else 'Vehicle'
-        if 'vehicle' in actor.type_id:
-            return 'Vehicle'
-    elif hasattr(actor, 'type'):
-        type_name = str(actor.type).split('.')[-1]
-        if type_name in ['Vehicles', 'Car', 'Truck', 'Bus', 'Motorcycle', 'Bicycle']:
-            return 'Vehicle'
-    return 'Actor'
+# occlusion placement search (project_bbox_for_transform,
+# compute_bbox_overlap_fraction, find_best_occlusion_transform,
+# place_pedestrian_for_occlusion) moved to occlusion.py - that logic is
+# complex enough it deserves its own file and its own set of knobs.
 
 
 def should_use_lights(weather_params):
@@ -847,25 +739,40 @@ def get_full_road_crossing_segment(waypoint, shoulder_margin=1.5, max_lanes_each
     return start, end
 
 
-def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestrian=True, max_rerolls=8):
+def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestrian=True,
+                            max_rerolls=8, occlusion_probability=1.0):
     """
-    Rolls actor counts within a scenario's (min, max) ranges, re-rolling
-    until pedestrians are present and at least min_optional_satisfied of
-    {vehicles, cyclists_scooters, trucks, occlusion target} are also
-    nonzero - gives images real variety without letting them go completely
-    empty/boring. If we run out of rerolls we just bump the best attempt
-    up to clear the bar instead of giving up.
+    Rolls actor counts (and the occlusion target) within a scenario's
+    (min, max) ranges, re-rolling until pedestrians are present and at
+    least min_optional_satisfied of {vehicles, cyclists_scooters, trucks,
+    occlusion} are also nonzero - gives images real variety without
+    letting them go completely empty/boring. If we run out of rerolls we
+    just bump the best attempt up to clear the bar instead of giving up.
+
+    occlusion_probability gates whether occlusion_percent gets rolled from
+    its range at all for a given image (1.0 = always roll it, 0.0 = never
+    occluded) - this is what actually controls how many images come out
+    occluded vs clear, independent of what the percentage range itself is.
     """
     def roll(key):
         lo, hi = scenario[key]
         return random.randint(lo, hi)
+
+    def roll_occlusion():
+        if random.random() > occlusion_probability:
+            return 0
+        # the gate just decided "this image gets occluded" - don't let the
+        # roll itself undo that by drawing 0 out of a range like (0, 75)
+        lo, hi = scenario['occlusion_percent']
+        lo = max(lo, 1)
+        return random.randint(lo, hi) if lo <= hi else hi
 
     def count_satisfied(counts):
         return sum([
             counts['vehicles'] > 0,
             counts['cyclists_scooters'] > 0,
             counts['trucks'] > 0,
-            scenario.get('occlusion_percent', 0) > 0,
+            counts['occlusion_percent'] > 0,
         ])
 
     best_counts = None
@@ -875,6 +782,7 @@ def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestri
             'vehicles': roll('vehicles'),
             'cyclists_scooters': roll('cyclists_scooters'),
             'trucks': roll('trucks'),
+            'occlusion_percent': roll_occlusion(),
         }
         if require_pedestrian and counts['pedestrians'] < 1:
             continue
@@ -883,7 +791,7 @@ def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestri
         if best_counts is None:
             best_counts = counts
 
-    counts = best_counts or {'pedestrians': 1, 'vehicles': 0, 'cyclists_scooters': 0, 'trucks': 0}
+    counts = best_counts or {'pedestrians': 1, 'vehicles': 0, 'cyclists_scooters': 0, 'trucks': 0, 'occlusion_percent': 0}
     if require_pedestrian and counts['pedestrians'] < 1:
         counts['pedestrians'] = 1
 
