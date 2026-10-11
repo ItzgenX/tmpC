@@ -11,27 +11,29 @@ import json
 
 
 from scenario_config import (
-    MAP_NAME, OUTPUT_DIR, DRAW_2D_BBOX, DRAW_3D_BBOX,
+    MAP_NAME, MAP_ROTATION, OUTPUT_DIR, DRAW_2D_BBOX, DRAW_3D_BBOX,
     SEPARATE_TRUCK_CLASS, CLASS_MAP, SCENARIOS,
     REQUIRE_PEDESTRIAN, MIN_OPTIONAL_CATEGORIES_SATISFIED, MAX_COUNT_REROLLS,
-    OCCLUSION_SEARCH_SAMPLES, OCCLUSION_PROGRESS_RANGE,
+    OCCLUSION_SEARCH_SAMPLES, OCCLUSION_PROGRESS_RANGE, OCCLUSION_OVERLAP_GRID,
+    OCCLUSION_TOLERANCE_PERCENT, OCCLUSION_PROBABILITY, OCCLUSION_STRICT,
     PEDESTRIAN_WALK_SPEED_RANGE, CROSSING_WARMUP_TICKS_RANGE, MAX_RENDER_DISTANCE,
-    JAYWALK_CROSSWALK_EXCLUSION_RADIUS,
+    JAYWALK_CROSSWALK_EXCLUSION_RADIUS, JAYWALK_PROBABILITY, FORCE_CROSSING_MODE,
     TRAFFIC_VEHICLE_SPAWN_DISTANCE_MIN, TRAFFIC_VEHICLE_SPAWN_DISTANCE_MAX, TRAFFIC_VEHICLE_SPAWN_LATERAL_RANGE,
     TRUCK_SPAWN_DISTANCE_MIN, TRUCK_SPAWN_DISTANCE_MAX, TRUCK_SPAWN_LATERAL_RANGE,
     CYCLIST_SCOOTER_SPAWN_DISTANCE_MIN, CYCLIST_SCOOTER_SPAWN_DISTANCE_MAX, CYCLIST_SCOOTER_SPAWN_LATERAL_RANGE,
     MIN_SEPARATION_BETWEEN_VEHICLES, MIN_SEPARATION_TRUCK_TO_CYCLIST, MAX_SPAWN_ATTEMPTS_PER_ACTOR,
     ALLOWED_CAR_VEHICLES, ALLOWED_TRUCK_VEHICLES, ALLOWED_CYCLIST_SCOOTER_VEHICLES,
-    ALLOWED_ESCOOTER_VEHICLES,
+    ALLOWED_ESCOOTER_VEHICLES, ALLOWED_TWO_WHEELER_VEHICLES,
 )
 from utils import (
     get_2d_bbox_from_3d, is_visible_and_not_occluded, carla_to_yolo,
     get_all_vehicle_bboxes, draw_3d_bbox_on_image, should_use_lights,
-    get_crosswalk_crossing_segments, find_best_occlusion_transform,
+    get_crosswalk_crossing_segments,
     get_crosswalk_centers, find_jaywalk_waypoint, get_full_road_crossing_segment,
     resolve_scenario_counts,
 )
 from spawner import spawn_actor, spawn_pedestrian_crossing, spawn_traffic_vehicles
+from occlusion import place_pedestrian_for_occlusion
 
 
 def scenario_dirs(scenario_name):
@@ -111,14 +113,20 @@ def destroy_frame_actors(client, actors, ego_vehicle, rgb_cam, seg_cam):
 def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestrian_bps,
                         walker_controller_bp, rgb_camera_bp, seg_camera_bp,
                         crossing_segments, spawn_points, crosswalk_centers,
-                        scenario, dirs, frame_index, manifest_writer):
+                        scenario, dirs, frame_index, manifest_writer, map_label):
     ego_vehicle = None
     rgb_cam = None
     seg_cam = None
     actors = []
 
     try:
-        is_jaywalk = random.random() < scenario.get('jaywalk_probability', 0.0)
+        if FORCE_CROSSING_MODE == "crosswalk_only":
+            is_jaywalk = False
+        elif FORCE_CROSSING_MODE == "jaywalk_only":
+            is_jaywalk = True
+        else:
+            is_jaywalk = scenario.get('allow_jaywalk', False) and random.random() < JAYWALK_PROBABILITY
+
         crossing_start = crossing_end = None
 
         if is_jaywalk:
@@ -130,6 +138,11 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
                 ego_transform = prev[0].transform if prev else jw_wp.transform
                 ego_transform.location.z += 0.5
                 crossing_start, crossing_end = get_full_road_crossing_segment(jw_wp)
+            elif FORCE_CROSSING_MODE == "jaywalk_only":
+                # forced jaywalk-only mode: don't silently swap to a legal
+                # crossing just because this attempt couldn't find a spot -
+                # fail the attempt instead, the outer loop will retry
+                return False
             else:
                 # couldn't find a spot far enough from every crosswalk this
                 # time, fall back to a normal legal crossing instead
@@ -158,9 +171,10 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
         ego_vehicle.set_simulate_physics(False)
 
         counts = resolve_scenario_counts(scenario, MIN_OPTIONAL_CATEGORIES_SATISFIED,
-                                          REQUIRE_PEDESTRIAN, MAX_COUNT_REROLLS)
+                                          REQUIRE_PEDESTRIAN, MAX_COUNT_REROLLS,
+                                          occlusion_probability=OCCLUSION_PROBABILITY)
         has_other_actors = counts['vehicles'] + counts['cyclists_scooters'] + counts['trucks'] > 0
-        target_occlusion_percent = scenario['occlusion_percent'] if has_other_actors else 0
+        target_occlusion_percent = counts['occlusion_percent'] if has_other_actors else 0
 
         vehicles_list = spawn_traffic_vehicles(
             world, blueprints, ego_transform, counts['vehicles'],
@@ -201,24 +215,28 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
 
         remaining_pedestrians = counts['pedestrians']
         achieved_occlusion_pct = 0.0
+        occlusion_within_tolerance = True
 
         if remaining_pedestrians > 0 and target_occlusion_percent > 0 and occluder_candidates:
-            template_ped, _ = spawn_pedestrian_crossing(
+            occluded_ped, occluded_controller, achieved_occlusion_pct, occlusion_within_tolerance = place_pedestrian_for_occlusion(
                 world, pedestrian_bps, walker_controller_bp,
-                crossing_start, crossing_end, progress=0.5,
+                crossing_start, crossing_end, occluder_candidates,
+                rgb_cam, target_occlusion_percent,
+                samples=OCCLUSION_SEARCH_SAMPLES, progress_range=OCCLUSION_PROGRESS_RANGE,
+                grid=OCCLUSION_OVERLAP_GRID, tolerance_percent=OCCLUSION_TOLERANCE_PERCENT,
                 speed_range=PEDESTRIAN_WALK_SPEED_RANGE
             )
-            if template_ped:
-                best = find_best_occlusion_transform(
-                    template_ped.bounding_box, crossing_start, crossing_end,
-                    occluder_candidates, rgb_cam, target_occlusion_percent,
-                    samples=OCCLUSION_SEARCH_SAMPLES, progress_range=OCCLUSION_PROGRESS_RANGE
-                )
-                if best:
-                    best_transform, achieved_occlusion_pct, _ = best
-                    template_ped.set_transform(best_transform)
-                actors.append(template_ped)
+            if occluded_ped:
+                actors.append(occluded_ped)
+                if occluded_controller:
+                    actors.append(occluded_controller)
                 remaining_pedestrians -= 1
+
+            if OCCLUSION_STRICT and not occlusion_within_tolerance:
+                # targeted occlusion but couldn't actually place it close
+                # enough to the target - don't save a frame that claims to
+                # be occluded but isn't, retry with a fresh roll instead
+                return False
 
         for _ in range(remaining_pedestrians):
             ped, controller = spawn_pedestrian_crossing(
@@ -326,7 +344,12 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
                 continue
             bbox_2d = get_2d_bbox_from_3d(bike, rgb_cam)
             if bbox_2d:
-                label_name = 'E-Scooter + Rider' if bike.type_id in ALLOWED_ESCOOTER_VEHICLES else 'Cyclist'
+                if bike.type_id in ALLOWED_ESCOOTER_VEHICLES:
+                    label_name = 'E-Scooter + Rider'
+                elif bike.type_id in ALLOWED_TWO_WHEELER_VEHICLES:
+                    label_name = 'Motorcycle'
+                else:
+                    label_name = 'Cyclist'
                 class_id = CLASS_MAP.get(label_name)
                 if class_id is not None:
                     valid_detections.append((class_id, label_name, bbox_2d, bike))
@@ -368,7 +391,10 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
                 }
                 if label_name == 'Pedestrian':
                     detection_3d["target_occlusion_percent"] = target_occlusion_percent
+                    detection_3d["achieved_occlusion_percent"] = round(achieved_occlusion_pct, 1)
+                    detection_3d["occlusion_within_tolerance"] = occlusion_within_tolerance
                     detection_3d["is_jaywalking"] = is_jaywalk
+                    detection_3d["map"] = map_label
                 annotations_3d.append(detection_3d)
 
         with open(label_path, 'w') as f:
@@ -393,9 +419,9 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
             cv2.imwrite(os.path.join(dirs['bbox_3d'], f"{image_name}_bbox_3d.png"), img_3d)
 
         manifest_writer.writerow([
-            image_name, scenario['name'], counts['pedestrians'], counts['vehicles'],
+            image_name, scenario['name'], map_label, counts['pedestrians'], counts['vehicles'],
             counts['cyclists_scooters'], counts['trucks'], target_occlusion_percent,
-            f"{achieved_occlusion_pct:.1f}", is_jaywalk
+            f"{achieved_occlusion_pct:.1f}", occlusion_within_tolerance, is_jaywalk
         ])
 
         return True
@@ -406,25 +432,7 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
         destroy_frame_actors(client, actors, ego_vehicle, rgb_cam, seg_cam)
 
 
-def main():
-    client = carla.Client('localhost', 2000)
-    client.set_timeout(10.0)
-    world = client.get_world()
-
-    if MAP_NAME:
-        current_map = world.get_map().name.split('/')[-1]
-        if current_map != MAP_NAME:
-            print(f"loading map: {MAP_NAME}")
-            world = client.load_world(MAP_NAME)
-            time.sleep(2.0)
-
-    blueprints = world.get_blueprint_library()
-
-    settings = world.get_settings()
-    settings.synchronous_mode = True
-    settings.fixed_delta_seconds = 0.05
-    world.apply_settings(settings)
-
+def setup_actor_blueprints(blueprints):
     vehicle_bp = blueprints.filter('my_car_xyz')[0]
     pedestrian_bps = blueprints.filter('walker.pedestrian.*')
     walker_controller_bp = blueprints.find('controller.ai.walker')
@@ -445,21 +453,111 @@ def main():
     seg_camera_bp.set_attribute('fov', '90')
     seg_camera_bp.set_attribute('sensor_tick', '0.05')
 
+    return vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp
+
+
+def scan_map_geometry(world):
     carla_map = world.get_map()
-    print("scanning crosswalks on this map...")
     crossing_segments = get_crosswalk_crossing_segments(carla_map)
     crosswalk_centers = get_crosswalk_centers(carla_map)
     spawn_points = carla_map.get_spawn_points()
+    return carla_map, crossing_segments, crosswalk_centers, spawn_points
 
-    if not crossing_segments:
-        print("no crosswalks found on this map, nothing to generate")
-        settings.synchronous_mode = False
-        settings.fixed_delta_seconds = None
-        world.apply_settings(settings)
+
+def apply_sync_settings(world):
+    settings = world.get_settings()
+    settings.synchronous_mode = True
+    settings.fixed_delta_seconds = 0.05
+    world.apply_settings(settings)
+    return settings
+
+
+def switch_map(client, map_name):
+    print(f"switching map: {map_name}")
+    world = client.load_world(map_name)
+    time.sleep(2.0)
+    apply_sync_settings(world)
+    return world
+
+
+def split_evenly(total, n):
+    base = total // n
+    remainder = total % n
+    return [base + (1 if i < remainder else 0) for i in range(n)]
+
+
+def resolve_map_chunks(number_images_to_generate):
+    """
+    Splits a scenario's image count across MAP_ROTATION if one is set, so
+    the same weather scenario gets built from several different maps
+    instead of repeating the same streets over and over. Returns a list
+    of (map_name_or_None, image_count) pairs; map_name is None when no
+    rotation is configured, meaning "don't touch the current map".
+    """
+    if not MAP_ROTATION:
+        return [(None, number_images_to_generate)]
+    counts = split_evenly(number_images_to_generate, len(MAP_ROTATION))
+    return list(zip(MAP_ROTATION, counts))
+
+
+def write_run_summary(manifest_path, summary_path):
+    """
+    Reads the manifest back and tallies what actually got generated, so
+    "did I get the mix I asked for" is a quick look instead of a guess -
+    total per scenario, crosswalk vs jaywalk, occluded vs clear, and the
+    spread across maps if MAP_ROTATION was used.
+    """
+    if not os.path.exists(manifest_path):
         return
 
-    print(f"found {len(crossing_segments)} crosswalk crossings, "
-          f"{len(crosswalk_centers)} crosswalk zones, {len(spawn_points)} map spawn points")
+    totals = {}
+    with open(manifest_path, newline='') as f:
+        for row in csv.DictReader(f):
+            name = row['scenario']
+            bucket = totals.setdefault(name, {
+                'total': 0, 'jaywalk': 0, 'crosswalk': 0,
+                'occluded': 0, 'clear': 0, 'maps': {}
+            })
+            bucket['total'] += 1
+            if row['is_jaywalking'] == 'True':
+                bucket['jaywalk'] += 1
+            else:
+                bucket['crosswalk'] += 1
+            if float(row['target_occlusion_percent']) > 0:
+                bucket['occluded'] += 1
+            else:
+                bucket['clear'] += 1
+            map_name = row.get('map') or 'current'
+            bucket['maps'][map_name] = bucket['maps'].get(map_name, 0) + 1
+
+    lines = ["Run summary", "=" * 60]
+    for name, bucket in totals.items():
+        lines.append(f"\n{name}: {bucket['total']} images")
+        lines.append(f"  crosswalk: {bucket['crosswalk']}   jaywalk: {bucket['jaywalk']}")
+        lines.append(f"  clear: {bucket['clear']}   occluded: {bucket['occluded']}")
+        if len(bucket['maps']) > 1 or 'current' not in bucket['maps']:
+            map_breakdown = ", ".join(f"{m}={c}" for m, c in sorted(bucket['maps'].items()))
+            lines.append(f"  maps: {map_breakdown}")
+
+    report = "\n".join(lines)
+    print("\n" + report)
+    with open(summary_path, 'w') as f:
+        f.write(report + "\n")
+
+
+def main():
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(10.0)
+    world = client.get_world()
+
+    if not MAP_ROTATION and MAP_NAME:
+        current_map = world.get_map().name.split('/')[-1]
+        if current_map != MAP_NAME:
+            world = switch_map(client, MAP_NAME)
+
+    settings = apply_sync_settings(world)
+    blueprints = world.get_blueprint_library()
+    vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = setup_actor_blueprints(blueprints)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     manifest_path = os.path.join(OUTPUT_DIR, "manifest.csv")
@@ -468,9 +566,9 @@ def main():
     manifest_writer = csv.writer(manifest_file)
     if manifest_is_new:
         manifest_writer.writerow([
-            "image_name", "scenario", "pedestrians", "vehicles",
+            "image_name", "scenario", "map", "pedestrians", "vehicles",
             "cyclists_scooters", "trucks", "target_occlusion_percent",
-            "achieved_occlusion_percent", "is_jaywalking"
+            "achieved_occlusion_percent", "occlusion_within_tolerance", "is_jaywalking"
         ])
 
     log_path = os.path.join(OUTPUT_DIR, "run_log.txt")
@@ -478,54 +576,78 @@ def main():
     try:
         for scenario in SCENARIOS:
             dirs = scenario_dirs(scenario['name'])
-            world.set_weather(scenario['weather'])
-            if should_use_lights(scenario['weather']):
-                try:
-                    light_manager = world.get_lightmanager()
-                    if light_manager:
-                        light_manager.turn_on(light_manager.get_all_lights())
-                except Exception:
-                    pass
-
             frame_index = next_frame_index(dirs['images'])
-            target_count = scenario['number_images_to_generate']
-            generated = 0
-            attempts = 0
-            # a hard ceiling so one broken scenario (bad map, no valid
-            # spawns, etc) can't spin forever without ever finishing
-            max_total_attempts = target_count * 3 + 20
+            map_chunks = resolve_map_chunks(scenario['number_images_to_generate'])
 
-            print(f"\nscenario '{scenario['name']}': target {target_count} images, "
-                  f"resuming at frame {frame_index}")
+            for map_name, chunk_target in map_chunks:
+                if chunk_target <= 0:
+                    continue
 
-            while generated < target_count and attempts < max_total_attempts:
-                attempts += 1
-                try:
-                    saved = generate_one_frame(
-                        client, world, carla_map, blueprints, vehicle_bp, pedestrian_bps,
-                        walker_controller_bp, rgb_camera_bp, seg_camera_bp,
-                        crossing_segments, spawn_points, crosswalk_centers,
-                        scenario, dirs, frame_index, manifest_writer
-                    )
-                    manifest_file.flush()
-                    if saved:
-                        generated += 1
-                        frame_index += 1
-                        if generated % 25 == 0:
-                            print(f"  {generated}/{target_count}")
-                except Exception as exc:
-                    log_error(log_path, f"scenario={scenario['name']} frame_index={frame_index} attempt={attempts}", exc)
-                    print(f"  frame failed, logged to {log_path}, continuing")
-                    time.sleep(0.5)
+                if map_name:
+                    current_map_name = world.get_map().name.split('/')[-1]
+                    if current_map_name != map_name:
+                        world = switch_map(client, map_name)
+                        settings = apply_sync_settings(world)
+                        blueprints = world.get_blueprint_library()
+                        vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = setup_actor_blueprints(blueprints)
 
-            if generated < target_count:
-                print(f"  only got {generated}/{target_count} for '{scenario['name']}' "
-                      f"after {attempts} attempts, moving on to the next scenario")
+                carla_map, crossing_segments, crosswalk_centers, spawn_points = scan_map_geometry(world)
+                map_label = map_name or world.get_map().name.split('/')[-1]
+
+                if not crossing_segments:
+                    print(f"no crosswalks found on {map_label}, skipping this chunk "
+                          f"({chunk_target} images not generated)")
+                    continue
+
+                world.set_weather(scenario['weather'])
+                if should_use_lights(scenario['weather']):
+                    try:
+                        light_manager = world.get_lightmanager()
+                        if light_manager:
+                            light_manager.turn_on(light_manager.get_all_lights())
+                    except Exception:
+                        pass
+
+                generated = 0
+                attempts = 0
+                # a hard ceiling so one broken chunk (bad map, no valid
+                # spawns, etc) can't spin forever without ever finishing
+                max_total_attempts = chunk_target * 3 + 20
+
+                print(f"\nscenario '{scenario['name']}' on {map_label}: "
+                      f"target {chunk_target} images, resuming at frame {frame_index}")
+
+                while generated < chunk_target and attempts < max_total_attempts:
+                    attempts += 1
+                    try:
+                        saved = generate_one_frame(
+                            client, world, carla_map, blueprints, vehicle_bp, pedestrian_bps,
+                            walker_controller_bp, rgb_camera_bp, seg_camera_bp,
+                            crossing_segments, spawn_points, crosswalk_centers,
+                            scenario, dirs, frame_index, manifest_writer, map_label
+                        )
+                        manifest_file.flush()
+                        if saved:
+                            generated += 1
+                            frame_index += 1
+                            if generated % 25 == 0:
+                                print(f"  {generated}/{chunk_target}")
+                    except Exception as exc:
+                        log_error(log_path, f"scenario={scenario['name']} map={map_label} "
+                                             f"frame_index={frame_index} attempt={attempts}", exc)
+                        print(f"  frame failed, logged to {log_path}, continuing")
+                        time.sleep(0.5)
+
+                if generated < chunk_target:
+                    print(f"  only got {generated}/{chunk_target} for '{scenario['name']}' on {map_label} "
+                          f"after {attempts} attempts, moving on")
     finally:
         manifest_file.close()
         settings.synchronous_mode = False
         settings.fixed_delta_seconds = None
         world.apply_settings(settings)
+
+    write_run_summary(manifest_path, os.path.join(OUTPUT_DIR, "summary.txt"))
 
 
 if __name__ == "__main__":
