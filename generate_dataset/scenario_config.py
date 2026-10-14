@@ -44,17 +44,35 @@ def build_class_map(separate_truck_class=SEPARATE_TRUCK_CLASS):
 CLASS_MAP = build_class_map()
 
 
-# Each row is one scenario. Counts (including occlusion_percent) are
-# (min, max) ranges rolled per image, not fixed numbers - see
+# --- exact image-type split ---
+# every scenario's number_images_to_generate gets split across these four
+# buckets by EXACT count, not probability - ask for 100 images with the
+# defaults below and you get exactly 25 of each, guaranteed, not "roughly
+# a quarter on average". percentages don't need to sum to 100 (they're
+# normalized), but keep them in the ratio you actually want.
+IMAGE_TYPE_SPLIT = {
+    "crosswalk_clear": 25,
+    "crosswalk_occluded": 25,
+    "jaywalk_clear": 25,
+    "jaywalk_occluded": 25,
+}
+
+# when an image's bucket is "*_occluded", the target percentage is rolled
+# uniformly across this whole range - this is the one knob for "a person
+# can be occluded anywhere from barely to almost completely". the lower
+# bound is nudged up to 1 at roll time so an "occluded" bucket image can
+# never silently land on 0% and look identical to a "clear" one.
+OCCLUSION_PERCENT_RANGE = (1, 100)
+
+
+# Each row is one weather scenario. pedestrians/vehicles/cyclists_scooters/
+# trucks are (min, max) ranges rolled per image - see
 # MIN_OPTIONAL_CATEGORIES_SATISFIED below for how that ties into which
-# rolled combinations actually get saved. Use occlusion_percent=(0, 0) for
-# "never occluded" or a wide range like (0, 75) to cover several occlusion
-# tiers from one scenario row instead of duplicating rows per percentage.
-# occlusion_percent is a target, not a guarantee - the placement search gets
-# close to it but real geometry doesn't always allow an exact match.
-# allow_jaywalk: whether this scenario is even eligible for a jaywalking
-# frame - the actual odds are one shared knob, JAYWALK_PROBABILITY below,
-# so you're not re-tuning a probability on every row.
+# rolled combinations actually get saved.
+# allow_jaywalk / allow_occlusion: whether this scenario's images are even
+# eligible for those buckets at all. If a scenario disallows one, that
+# bucket's quota (from IMAGE_TYPE_SPLIT above) folds into the nearest
+# allowed bucket instead of being dropped - see image_plan.py.
 # weather takes any carla.WeatherParameters object directly, so adding a new
 # scenario is just one more dict here, nothing else to touch.
 SCENARIOS = [
@@ -62,43 +80,43 @@ SCENARIOS = [
         name="clear",
         weather=carla.WeatherParameters.ClearNoon,
         pedestrians=(1, 2), vehicles=(0, 1), cyclists_scooters=(0, 1), trucks=(0, 1),
-        occlusion_percent=(0, 0), allow_jaywalk=False,
+        allow_jaywalk=False, allow_occlusion=False,
         number_images_to_generate=700,
     ),
     dict(
         name="partly_cloudy",
         weather=carla.WeatherParameters.CloudyNoon,
         pedestrians=(1, 3), vehicles=(0, 2), cyclists_scooters=(0, 2), trucks=(0, 1),
-        occlusion_percent=(0, 0), allow_jaywalk=True,
+        allow_jaywalk=True, allow_occlusion=False,
         number_images_to_generate=800,
     ),
     dict(
         name="overcast",
         weather=carla.WeatherParameters.WetCloudyNoon,
         pedestrians=(2, 5), vehicles=(1, 3), cyclists_scooters=(1, 3), trucks=(0, 2),
-        # single knob for the whole 0-75% occlusion range instead of
-        # separate 25/50/75 rows - each image rolls its own value in here
-        occlusion_percent=(0, 75), allow_jaywalk=True,
+        allow_jaywalk=True, allow_occlusion=True,
         number_images_to_generate=1700,
     ),
     dict(
         name="rain",
         weather=carla.WeatherParameters.HardRainNoon,
         pedestrians=(2, 5), vehicles=(1, 3), cyclists_scooters=(0, 2), trucks=(0, 2),
-        occlusion_percent=(0, 75), allow_jaywalk=True,
+        allow_jaywalk=True, allow_occlusion=True,
         number_images_to_generate=1100,
     ),
-    dict(
-        name="snowfall",
-        weather=carla.WeatherParameters(
-            cloudiness=100.0, precipitation=60.0, precipitation_deposits=80.0,
-            wind_intensity=30.0, sun_azimuth_angle=0.0, sun_altitude_angle=25.0,
-            fog_density=25.0, fog_distance=60.0, fog_falloff=1.5, wetness=30.0,
-        ),
-        pedestrians=(3, 5), vehicles=(2, 4), cyclists_scooters=(0, 0), trucks=(0, 0),
-        occlusion_percent=(0, 100), allow_jaywalk=False,
-        number_images_to_generate=700,
-    ),
+    # snowfall temporarily disabled - CARLA has no real snow assets and this
+    # was just a fog/wetness approximation anyway. uncomment to bring it back.
+    # dict(
+    #     name="snowfall",
+    #     weather=carla.WeatherParameters(
+    #         cloudiness=100.0, precipitation=60.0, precipitation_deposits=80.0,
+    #         wind_intensity=30.0, sun_azimuth_angle=0.0, sun_altitude_angle=25.0,
+    #         fog_density=25.0, fog_distance=60.0, fog_falloff=1.5, wetness=30.0,
+    #     ),
+    #     pedestrians=(3, 5), vehicles=(2, 4), cyclists_scooters=(0, 0), trucks=(0, 0),
+    #     allow_jaywalk=False, allow_occlusion=True,
+    #     number_images_to_generate=700,
+    # ),
 ]
 
 # CARLA has no snow ground/particle assets in the base town content, so
@@ -106,11 +124,13 @@ SCENARIOS = [
 # actual snow. Swap in a snow-enabled map + weather if you have one.
 
 
-# --- variety / acceptance rule ---
+# --- variety / acceptance rule (actor counts only - crossing type and
+# occlusion-or-not are now decided exactly by the plan above, not rolled) ---
 # every saved image must have at least one pedestrian, and at least this
-# many of {vehicles, cyclists_scooters, trucks, occlusion} present, or it
-# gets re-rolled. keeps images varied instead of every single one maxed out,
-# while still avoiding a bunch of empty "one person on a sidewalk" shots.
+# many of {vehicles, cyclists_scooters, trucks, this image's occlusion
+# bucket} present, or it gets re-rolled. keeps images varied instead of
+# every single one maxed out, while still avoiding a bunch of empty
+# "one person on a sidewalk" shots.
 REQUIRE_PEDESTRIAN = True
 MIN_OPTIONAL_CATEGORIES_SATISFIED = 2
 MAX_COUNT_REROLLS = 8
@@ -128,24 +148,10 @@ OCCLUSION_TOLERANCE_PERCENT = 12.0
 # higher is more precise but slower, this is plenty for a bbox-level estimate
 OCCLUSION_OVERLAP_GRID = 64
 
-# fraction of eligible images that actually get an occlusion target rolled
-# at all - without this, a scenario with occlusion_percent=(0, 75) would
-# roll *some* nonzero value on almost every single image (only 1/76 chance
-# of landing exactly on 0), which doesn't give you a real occluded/clear
-# mix. this is the knob for "how many of my images should be occlusion
-# images" - 0.6 means roughly 60% of eligible images get occluded, the
-# rest are left clear (occlusion_percent forced to 0 for that image).
-# set to 1.0 for a dedicated "occlusion only" run (combine with
-# OCCLUSION_STRICT below if you want that run to only keep frames that
-# actually hit the target, not just ones that tried to).
-OCCLUSION_PROBABILITY = 0.6
-
-# when True, a frame that targeted occlusion but landed outside
-# OCCLUSION_TOLERANCE_PERCENT of that target gets discarded and retried
-# instead of saved anyway - the search can't always find a usable occluder
-# in frame, and without this a "100% occlusion" image could quietly save
-# with 0% actually achieved. off by default since it costs extra retries;
-# turn on for a run where every occluded image needs to actually be occluded.
+# when True, an "*_occluded" image that couldn't actually be placed within
+# OCCLUSION_TOLERANCE_PERCENT of its rolled target gets discarded and
+# retried (same bucket, new roll) instead of saved with a misleading label.
+# off by default since it costs extra retries on maps with few occluders.
 OCCLUSION_STRICT = False
 
 
@@ -153,20 +159,6 @@ OCCLUSION_STRICT = False
 PEDESTRIAN_WALK_SPEED_RANGE = (0.9, 1.6)
 CROSSING_WARMUP_TICKS_RANGE = (35, 80)
 MAX_RENDER_DISTANCE = 50.0
-
-# odds of a jaywalk frame in any scenario with allow_jaywalk=True - one
-# shared knob instead of a separate probability on every scenario row
-JAYWALK_PROBABILITY = 0.12
-
-# override for a dedicated run instead of the normal random mix:
-#   None             -> normal behavior, JAYWALK_PROBABILITY decides per image
-#   "crosswalk_only" -> every image is a legal crosswalk crossing
-#   "jaywalk_only"   -> every image is a mid-road jaywalk (ignores each
-#                        scenario's allow_jaywalk flag - if you're forcing
-#                        this mode you clearly want it everywhere)
-# run the script once with this set, then flip it back (or comment it out)
-# for your normal mixed run.
-FORCE_CROSSING_MODE = None
 
 # a crosswalk must be at least this far from a jaywalk spot to count as
 # "not visible" - a bit more than render distance so it can't peek into
@@ -193,6 +185,23 @@ MIN_SEPARATION_BETWEEN_VEHICLES = 3.5
 # from other cars
 MIN_SEPARATION_TRUCK_TO_CYCLIST = 6.0
 MAX_SPAWN_ATTEMPTS_PER_ACTOR = 20
+
+
+# --- crash / disconnect resilience ---
+# if the client loses its connection to the server (server crashed, core
+# dumped, got killed) mid-run, the script doesn't just give up - it waits
+# and keeps trying to reconnect, since all per-image progress is already
+# persisted (frame numbering + the remaining plan are both read back from
+# disk). set RECONNECT_MAX_ATTEMPTS to None for "retry forever" (useful if
+# you're not standing at the keyboard to restart the server by hand).
+RECONNECT_RETRY_DELAY_SECONDS = 10.0
+RECONNECT_MAX_ATTEMPTS = 30
+
+# extra settle time after a batch of actors is destroyed, before the next
+# frame starts spawning - a tight spawn/destroy loop with no breathing
+# room is a known way to upset the UE4 side of CARLA over a long run
+POST_DESTROY_SETTLE_TICKS = 20
+POST_DESTROY_SETTLE_SECONDS = 0.3
 
 
 # --- blueprint categories ---
@@ -239,30 +248,31 @@ ALLOWED_CYCLIST_SCOOTER_VEHICLES = (
 
 
 # --- output folder naming ---
-# every run gets its own folder under OUTPUT_BASE_DIR, named after the
-# choices that were actually active (crossing mode, occlusion mode, map
-# setup) plus a timestamp - so a jaywalk_only batch, an occlusion-forced
-# batch, and a normal mixed run never land in the same folder and get
-# mixed together or have their manifests/frame numbering collide.
+# every fresh run gets its own folder under OUTPUT_BASE_DIR, named after
+# the image-type split that was actually active plus a timestamp, so two
+# different-config runs never land in the same folder by accident. to
+# continue a specific previous run after a crash/restart, pass its exact
+# folder via --resume instead of letting a new one get created - see
+# generate_scenarios.py's CLI help.
 #
 # this is a function, not a precomputed constant, because generate_scenarios.py
-# can override FORCE_CROSSING_MODE/OCCLUSION_PROBABILITY via CLI flags after
-# this module is imported - call resolve_output_dir() *after* applying those
-# overrides so the folder name stays honest about what actually ran.
-def resolve_output_dir():
-    if FORCE_CROSSING_MODE == "crosswalk_only":
-        crossing_tag = "crosswalk_only"
-    elif FORCE_CROSSING_MODE == "jaywalk_only":
-        crossing_tag = "jaywalk_only"
-    else:
-        crossing_tag = "mixed_crossing"
+# can override IMAGE_TYPE_SPLIT via CLI flags after this module is imported -
+# call resolve_output_dir() *after* applying those overrides so the folder
+# name stays honest about what actually ran.
+def resolve_output_dir(split_pct=None, mode_name=None):
+    split_pct = split_pct or IMAGE_TYPE_SPLIT
+    active = sorted((k, v) for k, v in split_pct.items() if v > 0)
 
-    if OCCLUSION_PROBABILITY >= 0.95:
-        occlusion_tag = "occlusion_forced"
-    elif OCCLUSION_PROBABILITY <= 0.0:
-        occlusion_tag = "no_occlusion"
+    if mode_name and mode_name != "mixed":
+        split_tag = mode_name
+    elif len(active) == 1:
+        split_tag = active[0][0]
+    elif not active:
+        split_tag = "empty_split"
+    elif active == sorted(IMAGE_TYPE_SPLIT.items()):
+        split_tag = "default_split"
     else:
-        occlusion_tag = f"occlusion_{round(OCCLUSION_PROBABILITY * 100)}pct"
+        split_tag = "custom_split"
 
     if MAP_ROTATION:
         map_tag = "map_rotation"
@@ -271,5 +281,5 @@ def resolve_output_dir():
     else:
         map_tag = "current_map"
 
-    run_tag = f"{crossing_tag}__{occlusion_tag}__{map_tag}"
+    run_tag = f"{split_tag}__{map_tag}"
     return os.path.join(OUTPUT_BASE_DIR, f"{run_tag}__{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
