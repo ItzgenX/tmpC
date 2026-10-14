@@ -4,7 +4,7 @@ import carla
 import numpy as np
 
 from utils import build_camera_intrinsics, project_vertices_to_2d, lerp_location
-from spawner import spawn_pedestrian_crossing
+from spawner import spawn_pedestrian_only, start_walker_controller
 
 
 def project_bbox_for_transform(bounding_box, transform, camera):
@@ -133,7 +133,13 @@ def place_pedestrian_for_occlusion(world, pedestrian_bps, walker_controller_bp,
     One call that does the whole occlusion-targeting job: spawns a
     pedestrian on the crossing line, searches for the spot along it that
     best matches target_percent against whatever vehicles/trucks/cyclists
-    are already in the scene, and moves the pedestrian there.
+    are already in the scene, repositions the pedestrian there, and only
+    then starts its AI walker controller.
+
+    That ordering matters: the controller never gets attached until the
+    pedestrian is at its final transform. Teleporting an actor that
+    already has a live walker controller navigating it is a known way to
+    desync CARLA's crowd-nav state - this avoids ever doing that.
 
     This is the main control point if you want to tune how occlusion
     generation behaves - samples/progress_range/grid affect how hard the
@@ -142,15 +148,22 @@ def place_pedestrian_for_occlusion(world, pedestrian_bps, walker_controller_bp,
     Returns (pedestrian, controller, achieved_percent, within_tolerance).
     pedestrian is None if nothing could even be spawned.
     """
-    pedestrian, controller = spawn_pedestrian_crossing(
-        world, pedestrian_bps, walker_controller_bp,
-        crossing_start, crossing_end, progress=0.5,
-        speed_range=speed_range
+    pedestrian, start_loc, _, _ = spawn_pedestrian_only(
+        world, pedestrian_bps, crossing_start, crossing_end, progress=0.5
     )
     if not pedestrian:
         return None, None, 0.0, False
 
+    # the search always assumes walking crossing_start -> crossing_end
+    # (that's the fixed yaw it scores candidates with), so once we've
+    # repositioned onto the search's line, the walk target follows suit
+    forward_yaw = math.degrees(math.atan2(crossing_end.y - crossing_start.y, crossing_end.x - crossing_start.x))
+
     if not occluder_candidates:
+        controller = start_walker_controller(
+            world, walker_controller_bp, pedestrian, start_loc, crossing_end, forward_yaw,
+            speed_range=speed_range
+        )
         return pedestrian, controller, 0.0, target_percent <= 0
 
     best = find_best_occlusion_transform(
@@ -159,9 +172,18 @@ def place_pedestrian_for_occlusion(world, pedestrian_bps, walker_controller_bp,
         samples=samples, progress_range=progress_range, grid=grid
     )
     if not best:
+        controller = start_walker_controller(
+            world, walker_controller_bp, pedestrian, start_loc, crossing_end, forward_yaw,
+            speed_range=speed_range
+        )
         return pedestrian, controller, 0.0, False
 
     best_transform, achieved_percent, _ = best
-    pedestrian.set_transform(best_transform)
+    pedestrian.set_transform(best_transform)  # safe - no controller attached yet
+
+    controller = start_walker_controller(
+        world, walker_controller_bp, pedestrian, best_transform.location, crossing_end, forward_yaw,
+        speed_range=speed_range
+    )
     within_tolerance = abs(achieved_percent - target_percent) <= tolerance_percent
     return pedestrian, controller, achieved_percent, within_tolerance
