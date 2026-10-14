@@ -1,3 +1,4 @@
+import argparse
 import carla
 import os
 import csv
@@ -11,7 +12,8 @@ import json
 
 
 from scenario_config import (
-    MAP_NAME, MAP_ROTATION, OUTPUT_DIR, DRAW_2D_BBOX, DRAW_3D_BBOX,
+    MAP_NAME, MAP_ROTATION, DRAW_2D_BBOX, DRAW_3D_BBOX,
+    resolve_output_dir,
     SEPARATE_TRUCK_CLASS, CLASS_MAP, SCENARIOS,
     REQUIRE_PEDESTRIAN, MIN_OPTIONAL_CATEGORIES_SATISFIED, MAX_COUNT_REROLLS,
     OCCLUSION_SEARCH_SAMPLES, OCCLUSION_PROGRESS_RANGE, OCCLUSION_OVERLAP_GRID,
@@ -34,6 +36,49 @@ from utils import (
 )
 from spawner import spawn_actor, spawn_pedestrian_crossing, spawn_traffic_vehicles
 from occlusion import place_pedestrian_for_occlusion
+
+# set for real in main(), after CLI overrides are applied - resolve_output_dir()
+# needs to see the final FORCE_CROSSING_MODE/OCCLUSION_PROBABILITY, so this
+# can't be resolved at import time the way the rest of the config is.
+OUTPUT_DIR = None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate the CARLA pedestrian-crossing dataset.")
+    parser.add_argument(
+        "--mode", choices=["mixed", "crosswalk_only", "jaywalk_only", "occlusion_only"],
+        default="mixed",
+        help="mixed (default): normal random mix as configured in scenario_config.py. "
+             "crosswalk_only / jaywalk_only: force every image to that crossing type "
+             "(same as setting FORCE_CROSSING_MODE). occlusion_only: force occlusion on "
+             "every image and only keep frames that actually hit it (same as "
+             "OCCLUSION_PROBABILITY=1.0 + OCCLUSION_STRICT=True)."
+    )
+    parser.add_argument(
+        "--count", type=int, default=None,
+        help="override number_images_to_generate for every scenario in SCENARIOS "
+             "(e.g. --count 50 for a quick 50-per-weather-scenario test batch). "
+             "Weather still cycles through the full SCENARIOS table either way - "
+             "this only changes how many images each one makes."
+    )
+    return parser.parse_args()
+
+
+def apply_cli_overrides(args):
+    global FORCE_CROSSING_MODE, OCCLUSION_PROBABILITY, OCCLUSION_STRICT
+
+    if args.mode == "crosswalk_only":
+        FORCE_CROSSING_MODE = "crosswalk_only"
+    elif args.mode == "jaywalk_only":
+        FORCE_CROSSING_MODE = "jaywalk_only"
+    elif args.mode == "occlusion_only":
+        OCCLUSION_PROBABILITY = 1.0
+        OCCLUSION_STRICT = True
+    # "mixed" leaves everything exactly as scenario_config.py has it
+
+    if args.count is not None:
+        for scenario in SCENARIOS:
+            scenario['number_images_to_generate'] = args.count
 
 
 def scenario_dirs(scenario_name):
@@ -545,7 +590,14 @@ def write_run_summary(manifest_path, summary_path):
         f.write(report + "\n")
 
 
-def main():
+def main(cli_args=None):
+    global OUTPUT_DIR
+
+    if cli_args is None:
+        cli_args = parse_args()
+    apply_cli_overrides(cli_args)
+    OUTPUT_DIR = resolve_output_dir()
+
     client = carla.Client('localhost', 2000)
     client.set_timeout(10.0)
     world = client.get_world()

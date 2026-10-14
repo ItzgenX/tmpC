@@ -65,10 +65,24 @@ That's it for a default run. It will:
    generated: how many were crosswalk vs. jaywalk, how many were occluded
    vs. clear, per scenario.
 
-There is **no CLI flag support** right now — every choice (which map, how
-many images, forced crosswalk-only/jaywalk-only, occlusion rate, etc.) is
-made by editing `scenario_config.py` before you run it. See §6 for the
-exact edits for common cases.
+Two CLI flags cover the most common overrides without editing anything:
+
+```bash
+python generate_scenarios.py --mode jaywalk_only --count 50
+python generate_scenarios.py --mode crosswalk_only --count 50
+python generate_scenarios.py --mode occlusion_only --count 50
+python generate_scenarios.py --mode mixed   # or just omit --mode entirely
+```
+
+`--mode` forces the crossing/occlusion behavior for the whole run;
+`--count` overrides `number_images_to_generate` on every scenario in
+`SCENARIOS` (so `--count 50` means 50 images for *each* of the 5 weather
+scenarios — 250 total — not 50 total). Weather still cycles through the
+full `SCENARIOS` table regardless of `--mode`, so an `occlusion_only` or
+`jaywalk_only` batch still covers clear/cloudy/overcast/rain/snow, not
+just one weather. Everything else (which map, map rotation, exact
+per-scenario counts/ranges, etc.) is still edited directly in
+`scenario_config.py` — see §6 for exact recipes.
 
 ---
 
@@ -312,49 +326,58 @@ SEPARATE_TRUCK_CLASS = True   # False -> trucks get labeled "Vehicle" instead of
 
 ## 6. Common recipes
 
-All of these are edits to `scenario_config.py`, then `python generate_scenarios.py`.
-
 **Only legal crosswalk crossings, no jaywalking at all:**
-```python
-FORCE_CROSSING_MODE = "crosswalk_only"
+```bash
+python generate_scenarios.py --mode crosswalk_only
+```
+(or set `FORCE_CROSSING_MODE = "crosswalk_only"` in `scenario_config.py`
+if you want this to be the permanent default rather than a one-off run)
+
+**Only jaywalking** (ignores each scenario's `allow_jaywalk` — if you're
+forcing this mode you clearly want it everywhere):
+```bash
+python generate_scenarios.py --mode jaywalk_only
 ```
 
-**Only jaywalking (ignores each scenario's `allow_jaywalk` — if you're
-forcing this mode you want it everywhere):**
-```python
-FORCE_CROSSING_MODE = "jaywalk_only"
+**Every image occluded, only keeping ones that actually hit the target:**
+```bash
+python generate_scenarios.py --mode occlusion_only
 ```
 
-**Every image occluded, and only keep ones that actually hit the target:**
-```python
-OCCLUSION_PROBABILITY = 1.0
-OCCLUSION_STRICT = True
-```
-
-**No occlusion at all:**
+**No occlusion at all** (no `--mode` for this one, edit the config):
 ```python
 OCCLUSION_PROBABILITY = 0.0
 ```
 
-**A small test batch (e.g. 50 images) instead of the full production run:**
-Lower `number_images_to_generate` on the scenarios you care about (or all
-five). There's no `--count` flag yet — see the note at the end of this
-section.
+**50 images of each type, as three separate batches:**
+```bash
+python generate_scenarios.py --mode crosswalk_only --count 50
+python generate_scenarios.py --mode jaywalk_only --count 50
+python generate_scenarios.py --mode occlusion_only --count 50
+```
+Each writes to its own timestamped folder (§4), so these three never
+collide. `--count 50` applies to *every* scenario in `SCENARIOS`, so each
+command above actually produces 50 × 5 = 250 images (50 for clear, 50 for
+partly_cloudy, 50 for overcast, etc.) — there's currently no flag to mean
+"50 total regardless of weather." If you want exactly 50 total instead,
+temporarily trim `SCENARIOS` down to one entry, or ask and I'll add a
+`--count-is-total` style flag.
 
-**Spread one scenario across several maps for variety:**
+**A quick small test run without forcing any particular mode:**
+```bash
+python generate_scenarios.py --count 20
+```
+
+**Spread one scenario across several maps for variety** (no flag for
+this, edit the config):
 ```python
 MAP_ROTATION = ["Town01", "Town02", "Town03", "Town10HD_Opt"]
 ```
 
-Remember to flip `FORCE_CROSSING_MODE` back to `None` and
-`OCCLUSION_PROBABILITY`/`OCCLUSION_STRICT` back to their normal values
-afterward if you want your next run to go back to the default mixed
-behavior.
-
-> **Known gap:** doing "50 crosswalk-only + 50 jaywalk-only + 50
-> occlusion-only" today means editing the config and re-running the script
-> three separate times. A `--mode`/`--count` CLI flag to do this in one
-> command was planned but not finished — ask if you want it added.
+Anything set via `--mode`/`--count` only applies to that one run — it
+doesn't modify `scenario_config.py`, so your next plain
+`python generate_scenarios.py` (no flags) goes back to whatever's
+actually written in the file.
 
 ---
 
@@ -389,8 +412,9 @@ behavior.
   behind the pedestrian), but a car's rectangular bounding box can stick
   out slightly past its visible silhouette, so "achieved occlusion %" is
   an estimate, not an exact pixel count.
-- **No CLI arguments.** Every run is driven entirely by editing
-  `scenario_config.py`. See the note in §6.
+- **`--count` scales with the scenario table, not a flat total.** `--count 50`
+  means 50 images *per scenario* (250 total across the 5 weather
+  scenarios), not 50 images total. See §6.
 - **This hasn't been run against a live CARLA server from the environment
   this was developed in** — it's been checked for internal consistency
   (every cross-module import resolves, every function signature matches

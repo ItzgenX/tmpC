@@ -244,7 +244,12 @@ ALLOWED_CYCLIST_SCOOTER_VEHICLES = (
 # setup) plus a timestamp - so a jaywalk_only batch, an occlusion-forced
 # batch, and a normal mixed run never land in the same folder and get
 # mixed together or have their manifests/frame numbering collide.
-def _describe_run():
+#
+# this is a function, not a precomputed constant, because generate_scenarios.py
+# can override FORCE_CROSSING_MODE/OCCLUSION_PROBABILITY via CLI flags after
+# this module is imported - call resolve_output_dir() *after* applying those
+# overrides so the folder name stays honest about what actually ran.
+def resolve_output_dir():
     if FORCE_CROSSING_MODE == "crosswalk_only":
         crossing_tag = "crosswalk_only"
     elif FORCE_CROSSING_MODE == "jaywalk_only":
@@ -266,10 +271,5 @@ def _describe_run():
     else:
         map_tag = "current_map"
 
-    return f"{crossing_tag}__{occlusion_tag}__{map_tag}"
-
-
-OUTPUT_DIR = os.path.join(
-    OUTPUT_BASE_DIR,
-    f"{_describe_run()}__{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-)
+    run_tag = f"{crossing_tag}__{occlusion_tag}__{map_tag}"
+    return os.path.join(OUTPUT_BASE_DIR, f"{run_tag}__{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
