@@ -148,9 +148,20 @@ OCCLUSION_TOLERANCE_PERCENT = 12.0
 # higher is more precise but slower, this is plenty for a bbox-level estimate
 OCCLUSION_OVERLAP_GRID = 64
 
-# when True, an "*_occluded" image that couldn't actually be placed within
-# OCCLUSION_TOLERANCE_PERCENT of its rolled target gets discarded and
-# retried (same bucket, new roll) instead of saved with a misleading label.
+# hard floor on an "*_occluded" image: if the placement search can't
+# actually get at least this much of the pedestrian covered, the attempt
+# is thrown away and retried - never saved. this is the real guarantee
+# that "occluded" means occluded: it's checked unconditionally, it doesn't
+# depend on OCCLUSION_STRICT below, and it can't be satisfied by a low
+# rolled target plus a close-enough miss (e.g. target 5%, achieved 3%
+# would pass OCCLUSION_STRICT's tolerance check but isn't visibly occluded -
+# this catches that case too).
+OCCLUSION_MIN_ACHIEVED_PERCENT = 15.0
+
+# when True, an "*_occluded" image that cleared the floor above but still
+# landed outside OCCLUSION_TOLERANCE_PERCENT of its specific rolled target
+# gets discarded and retried too - use this if you need occlusion amounts
+# to track their rolled target closely, not just "occluded at all".
 # off by default since it costs extra retries on maps with few occluders.
 OCCLUSION_STRICT = False
 
