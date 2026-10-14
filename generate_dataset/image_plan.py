@@ -63,17 +63,18 @@ def plan_path(scenario_dir):
 
 def load_or_build_plan(scenario_dir, n, split_pct, allow_jaywalk, allow_occlusion):
     """
-    Resumes a scenario's remaining plan from disk if one exists (this is
-    what makes a crash/restart not throw away progress - the plan file is
-    only ever the *remaining* work, consumed and rewritten one image at a
-    time by consume_plan_item), otherwise builds a fresh one.
+    Resumes a scenario's remaining plan from disk if a plan file exists
+    (this is what makes a crash/restart not throw away progress - the
+    plan file is only ever the *remaining* work, consumed and rewritten
+    one image at a time by consume_plan_item), otherwise builds a fresh
+    one. An existing file that's an empty list is a real, meaningful
+    state - it means this scenario already finished - and must be
+    returned as-is, not treated as "nothing there yet" and rebuilt.
     """
     path = plan_path(scenario_dir)
     if os.path.exists(path):
         with open(path) as f:
-            saved = json.load(f)
-        if saved:
-            return saved
+            return json.load(f)
 
     plan = build_image_plan(n, split_pct, allow_jaywalk, allow_occlusion)
     save_plan(scenario_dir, plan)

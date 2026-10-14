@@ -775,9 +775,16 @@ def main(cli_args=None):
                           f"after {attempts} attempts, moving on")
     finally:
         manifest_file.close()
-        settings.synchronous_mode = False
-        settings.fixed_delta_seconds = None
-        world.apply_settings(settings)
+        # if we got here because reconnecting failed entirely, world/settings
+        # still point at the dead connection - don't let that cleanup attempt
+        # throw a second exception that masks the real "couldn't reconnect"
+        # error with a confusing one about a closed connection
+        try:
+            settings.synchronous_mode = False
+            settings.fixed_delta_seconds = None
+            world.apply_settings(settings)
+        except Exception:
+            pass
 
     write_run_summary(manifest_path, os.path.join(output_dir, "summary.txt"))
 
