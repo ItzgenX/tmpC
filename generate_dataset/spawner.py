@@ -162,16 +162,19 @@ def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_d
     return spawned_vehicles
 
 
-def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
-                               crossing_start, crossing_end,
-                               progress=None, speed_range=(0.9, 1.6)):
-    # walks a pedestrian along crossing_start -> crossing_end (or the
-    # reverse) using CARLA's AI walker controller so it's an actual walk
-    # cycle toward the far side, not just standing there. works the same
-    # whether the line comes from a crosswalk polygon or a plain road width
-    # (jaywalk case), since it's just two points either way.
-    # progress is where along the line to start (0..1); random near one
-    # end by default so there's room left to walk before the capture.
+def spawn_pedestrian_only(world, pedestrian_bps, crossing_start, crossing_end, progress=None):
+    """
+    Spawns just the pedestrian actor on the crossing line - no AI walker
+    controller yet. Split out from spawn_pedestrian_crossing so a caller
+    that needs to reposition the pedestrian first (the occlusion search)
+    can do that via set_transform before any controller exists. Teleporting
+    an actor that already has a live walker controller navigating it is a
+    known way to desync/corrupt CARLA's crowd-nav state and has been a
+    likely source of native-side crashes here - never do that; spawn,
+    reposition if needed, then start the controller, in that order.
+
+    Returns (pedestrian, start_loc, target_loc, yaw) or (None, None, None, None).
+    """
     if progress is None:
         progress = random.uniform(0.05, 0.35)
 
@@ -195,10 +198,19 @@ def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
 
     pedestrian = spawn_actor(world, ped_bp, spawn_transform)
     if not pedestrian:
-        return None, None
+        return None, None, None, None
 
     world.tick()
+    return pedestrian, start_loc, target_loc, yaw
 
+
+def start_walker_controller(world, walker_controller_bp, pedestrian, start_loc, target_loc, yaw,
+                             speed_range=(0.9, 1.6)):
+    """
+    Attaches and starts the AI walker controller on a pedestrian that's
+    already at its final starting transform. Don't call set_transform on
+    the pedestrian again after this - see spawn_pedestrian_only's note.
+    """
     controller = None
     speed = random.uniform(*speed_range)
     try:
@@ -218,6 +230,25 @@ def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
         control.speed = speed
         pedestrian.apply_control(control)
 
+    return controller
+
+
+def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
+                               crossing_start, crossing_end,
+                               progress=None, speed_range=(0.9, 1.6)):
+    # spawn + start walking immediately - for the normal case where
+    # nothing needs to reposition the pedestrian afterward. works the
+    # same whether the line comes from a crosswalk polygon or a plain
+    # road width (jaywalk case), since it's just two points either way.
+    pedestrian, start_loc, target_loc, yaw = spawn_pedestrian_only(
+        world, pedestrian_bps, crossing_start, crossing_end, progress=progress
+    )
+    if not pedestrian:
+        return None, None
+
+    controller = start_walker_controller(
+        world, walker_controller_bp, pedestrian, start_loc, target_loc, yaw, speed_range=speed_range
+    )
     return pedestrian, controller
 
 

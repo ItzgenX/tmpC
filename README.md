@@ -457,6 +457,26 @@ things now address this:
    is a known way to upset CARLA's UE4 side over a long run (spawn
    collisions, instability). `POST_DESTROY_SETTLE_TICKS`/`_SECONDS` now
    add a short pause after every single frame, success or failure.
+4. **A specific native-crash fix.** If your symptom is the *script*
+   segfaulting while the CARLA server itself stays up and fine (the
+   giveaway: no Python traceback at all, just "core dumped," and
+   restarting the script immediately works again) — that's not something
+   point 2 above catches, since a segfault isn't a catchable Python
+   exception. The most likely cause found in this code: the occlusion
+   placement search (`occlusion.py`) used to attach and start a
+   pedestrian's AI walker controller *first*, then call
+   `pedestrian.set_transform(...)` afterward to move it into position.
+   Teleporting an actor that already has a live crowd-nav controller
+   running is a known way to corrupt CARLA's native-side navigation
+   state. This is now fixed: `spawner.py`'s pedestrian spawning is split
+   into `spawn_pedestrian_only` (just the actor, no controller) and
+   `start_walker_controller` (attaches + starts it), and the occlusion
+   path always repositions the pedestrian via `spawn_pedestrian_only` +
+   `set_transform` *before* the controller is ever attached. If you were
+   hitting this specific symptom, it should be resolved; if a script-side
+   core dump still happens, it's worth checking whether it only ever
+   occurs on `*_occluded` images specifically (which would point at
+   something else occlusion-related) versus any image type.
 
 None of this can make Python relaunch a CarlaUE4 process that's actually
 dead — something (you, or a supervisor/systemd unit) still has to restart
