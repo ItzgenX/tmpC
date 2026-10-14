@@ -287,9 +287,10 @@ image is occluded come from the exact plan (§5.2), not from a roll here.
 ```python
 OCCLUSION_SEARCH_SAMPLES = 25        # how many points along the crossing to test
 OCCLUSION_PROGRESS_RANGE = (0.15, 0.85)
-OCCLUSION_TOLERANCE_PERCENT = 12.0   # how close to target counts as "close enough"
+OCCLUSION_TOLERANCE_PERCENT = 12.0   # how close to target counts as "close enough" (OCCLUSION_STRICT only)
 OCCLUSION_OVERLAP_GRID = 64          # resolution of the overlap-scoring grid
-OCCLUSION_STRICT = False             # discard+retry instead of saving a miss
+OCCLUSION_MIN_ACHIEVED_PERCENT = 15.0  # hard floor - see below, this is the real guarantee
+OCCLUSION_STRICT = False             # extra: discard+retry a miss vs its own target too
 ```
 
 How it actually works: `occlusion.py` only ever uses vehicles/trucks/
@@ -302,13 +303,22 @@ nearest-to-camera traffic actors by the closest percentage to that
 target. It checks camera depth, not just 2D overlap — an "occluder"
 that's actually behind the pedestrian doesn't count.
 
-If a scenario's rolled actor counts come out with nothing to occlude
-with, that attempt fails and retries (so an `*_occluded` bucket item
-never silently gets saved as a clear image). `OCCLUSION_STRICT` closes
-the other gap: even when there's something to occlude with, the search
-might only manage a poor match. With `OCCLUSION_STRICT = True`, a miss
-outside `OCCLUSION_TOLERANCE_PERCENT` of the target is discarded and
-retried instead of saved with a misleading label.
+**The guarantee that `*_occluded` actually means occluded** is
+`OCCLUSION_MIN_ACHIEVED_PERCENT` — this is checked unconditionally, every
+time, independent of everything else below it. If the achieved coverage
+comes in under this floor (nothing to occlude with, a bad camera angle,
+or just a weak match), the attempt is thrown away and retried with a
+fresh roll — never saved. This also covers a case a pure "close to
+target" check wouldn't: a low rolled target (say 5%) matched almost
+exactly (achieved 4%) would pass a tolerance check but isn't visibly
+occluded to the eye — the floor rejects it regardless of how close it
+was to its own target.
+
+`OCCLUSION_STRICT` is a separate, optional, stricter check on top: even
+after clearing the floor, if you want the achieved amount to also track
+its own specific rolled target closely (not just "occluded at all"), set
+`OCCLUSION_STRICT = True` and misses outside `OCCLUSION_TOLERANCE_PERCENT`
+get discarded too.
 
 ### 5.5 Traffic realism & blueprint categories
 

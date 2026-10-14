@@ -17,7 +17,7 @@ from scenario_config import (
     SEPARATE_TRUCK_CLASS, CLASS_MAP, SCENARIOS, IMAGE_TYPE_SPLIT, OCCLUSION_PERCENT_RANGE,
     REQUIRE_PEDESTRIAN, MIN_OPTIONAL_CATEGORIES_SATISFIED, MAX_COUNT_REROLLS,
     OCCLUSION_SEARCH_SAMPLES, OCCLUSION_PROGRESS_RANGE, OCCLUSION_OVERLAP_GRID,
-    OCCLUSION_TOLERANCE_PERCENT, OCCLUSION_STRICT,
+    OCCLUSION_TOLERANCE_PERCENT, OCCLUSION_STRICT, OCCLUSION_MIN_ACHIEVED_PERCENT,
     PEDESTRIAN_WALK_SPEED_RANGE, CROSSING_WARMUP_TICKS_RANGE, MAX_RENDER_DISTANCE,
     JAYWALK_CROSSWALK_EXCLUSION_RADIUS,
     TRAFFIC_VEHICLE_SPAWN_DISTANCE_MIN, TRAFFIC_VEHICLE_SPAWN_DISTANCE_MAX, TRAFFIC_VEHICLE_SPAWN_LATERAL_RANGE,
@@ -284,10 +284,17 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
                     actors.append(occluded_controller)
                 remaining_pedestrians -= 1
 
+            if achieved_occlusion_pct < OCCLUSION_MIN_ACHIEVED_PERCENT:
+                # hard floor, always enforced: this bucket means the
+                # pedestrian has to actually be occluded in the saved
+                # image, not just "we tried" - a miss (or no spawn at
+                # all) gets retried rather than saved under a false label
+                return False
+
             if OCCLUSION_STRICT and not occlusion_within_tolerance:
-                # targeted occlusion but couldn't actually place it close
-                # enough to the target - don't save a frame that claims to
-                # be occluded but isn't, retry with a fresh roll instead
+                # cleared the floor above but still didn't land close to
+                # its own rolled target - don't save it, retry with a
+                # fresh roll instead
                 return False
 
         for _ in range(remaining_pedestrians):
