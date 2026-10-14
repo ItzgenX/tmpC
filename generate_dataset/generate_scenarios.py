@@ -14,18 +14,20 @@ import json
 from scenario_config import (
     MAP_NAME, MAP_ROTATION, DRAW_2D_BBOX, DRAW_3D_BBOX,
     resolve_output_dir,
-    SEPARATE_TRUCK_CLASS, CLASS_MAP, SCENARIOS,
+    SEPARATE_TRUCK_CLASS, CLASS_MAP, SCENARIOS, IMAGE_TYPE_SPLIT, OCCLUSION_PERCENT_RANGE,
     REQUIRE_PEDESTRIAN, MIN_OPTIONAL_CATEGORIES_SATISFIED, MAX_COUNT_REROLLS,
     OCCLUSION_SEARCH_SAMPLES, OCCLUSION_PROGRESS_RANGE, OCCLUSION_OVERLAP_GRID,
-    OCCLUSION_TOLERANCE_PERCENT, OCCLUSION_PROBABILITY, OCCLUSION_STRICT,
+    OCCLUSION_TOLERANCE_PERCENT, OCCLUSION_STRICT,
     PEDESTRIAN_WALK_SPEED_RANGE, CROSSING_WARMUP_TICKS_RANGE, MAX_RENDER_DISTANCE,
-    JAYWALK_CROSSWALK_EXCLUSION_RADIUS, JAYWALK_PROBABILITY, FORCE_CROSSING_MODE,
+    JAYWALK_CROSSWALK_EXCLUSION_RADIUS,
     TRAFFIC_VEHICLE_SPAWN_DISTANCE_MIN, TRAFFIC_VEHICLE_SPAWN_DISTANCE_MAX, TRAFFIC_VEHICLE_SPAWN_LATERAL_RANGE,
     TRUCK_SPAWN_DISTANCE_MIN, TRUCK_SPAWN_DISTANCE_MAX, TRUCK_SPAWN_LATERAL_RANGE,
     CYCLIST_SCOOTER_SPAWN_DISTANCE_MIN, CYCLIST_SCOOTER_SPAWN_DISTANCE_MAX, CYCLIST_SCOOTER_SPAWN_LATERAL_RANGE,
     MIN_SEPARATION_BETWEEN_VEHICLES, MIN_SEPARATION_TRUCK_TO_CYCLIST, MAX_SPAWN_ATTEMPTS_PER_ACTOR,
     ALLOWED_CAR_VEHICLES, ALLOWED_TRUCK_VEHICLES, ALLOWED_CYCLIST_SCOOTER_VEHICLES,
     ALLOWED_ESCOOTER_VEHICLES, ALLOWED_TWO_WHEELER_VEHICLES,
+    RECONNECT_RETRY_DELAY_SECONDS, RECONNECT_MAX_ATTEMPTS,
+    POST_DESTROY_SETTLE_TICKS, POST_DESTROY_SETTLE_SECONDS,
 )
 from utils import (
     get_2d_bbox_from_3d, is_visible_and_not_occluded, carla_to_yolo,
@@ -36,11 +38,22 @@ from utils import (
 )
 from spawner import spawn_actor, spawn_pedestrian_crossing, spawn_traffic_vehicles
 from occlusion import place_pedestrian_for_occlusion
+from image_plan import load_or_build_plan, consume_plan_item
 
-# set for real in main(), after CLI overrides are applied - resolve_output_dir()
-# needs to see the final FORCE_CROSSING_MODE/OCCLUSION_PROBABILITY, so this
-# can't be resolved at import time the way the rest of the config is.
-OUTPUT_DIR = None
+
+# a shortcut for the three "every image is one type" batches - percentages
+# within each still follow the same clear/occluded split as the default,
+# just restricted to one crossing type
+MODE_SPLITS = {
+    "crosswalk_only": {"crosswalk_clear": 50, "crosswalk_occluded": 50, "jaywalk_clear": 0, "jaywalk_occluded": 0},
+    "jaywalk_only": {"crosswalk_clear": 0, "crosswalk_occluded": 0, "jaywalk_clear": 50, "jaywalk_occluded": 50},
+    "occlusion_only": {"crosswalk_clear": 0, "crosswalk_occluded": 50, "jaywalk_clear": 0, "jaywalk_occluded": 50},
+}
+
+CONNECTION_ERROR_HINTS = [
+    "time-out", "timeout", "time out", "failed to connect", "connection",
+    "broken pipe", "not responding", "unable to connect", "disconnected",
+]
 
 
 def parse_args():
@@ -48,41 +61,39 @@ def parse_args():
     parser.add_argument(
         "--mode", choices=["mixed", "crosswalk_only", "jaywalk_only", "occlusion_only"],
         default="mixed",
-        help="mixed (default): normal random mix as configured in scenario_config.py. "
-             "crosswalk_only / jaywalk_only: force every image to that crossing type "
-             "(same as setting FORCE_CROSSING_MODE). occlusion_only: force occlusion on "
-             "every image and only keep frames that actually hit it (same as "
-             "OCCLUSION_PROBABILITY=1.0 + OCCLUSION_STRICT=True)."
+        help="mixed (default): the exact split from IMAGE_TYPE_SPLIT in scenario_config.py "
+             "(25/25/25/25 by default). crosswalk_only/jaywalk_only/occlusion_only: restrict "
+             "to that type for this run only - doesn't touch scenario_config.py."
     )
     parser.add_argument(
         "--count", type=int, default=None,
         help="override number_images_to_generate for every scenario in SCENARIOS "
-             "(e.g. --count 50 for a quick 50-per-weather-scenario test batch). "
-             "Weather still cycles through the full SCENARIOS table either way - "
-             "this only changes how many images each one makes."
+             "(e.g. --count 50 means 50 images for EACH weather scenario, not 50 total)."
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="path to a previous run's output folder (e.g. "
+             "dataset_scenarios/default_split__current_map__20261014_120000) to continue "
+             "instead of starting a fresh timestamped one. Frame numbering and each "
+             "scenario's remaining image-type plan both resume from what's on disk, so "
+             "a run interrupted by a crash doesn't lose progress."
     )
     return parser.parse_args()
 
 
-def apply_cli_overrides(args):
-    global FORCE_CROSSING_MODE, OCCLUSION_PROBABILITY, OCCLUSION_STRICT
-
-    if args.mode == "crosswalk_only":
-        FORCE_CROSSING_MODE = "crosswalk_only"
-    elif args.mode == "jaywalk_only":
-        FORCE_CROSSING_MODE = "jaywalk_only"
-    elif args.mode == "occlusion_only":
-        OCCLUSION_PROBABILITY = 1.0
-        OCCLUSION_STRICT = True
-    # "mixed" leaves everything exactly as scenario_config.py has it
-
-    if args.count is not None:
-        for scenario in SCENARIOS:
-            scenario['number_images_to_generate'] = args.count
+def resolve_split(mode):
+    if mode == "mixed":
+        return IMAGE_TYPE_SPLIT
+    return MODE_SPLITS[mode]
 
 
-def scenario_dirs(scenario_name):
-    base = os.path.join(OUTPUT_DIR, scenario_name)
+def looks_like_connection_error(exc):
+    msg = str(exc).lower()
+    return any(hint in msg for hint in CONNECTION_ERROR_HINTS)
+
+
+def scenario_dirs(output_dir, scenario_name):
+    base = os.path.join(output_dir, scenario_name)
     dirs = {
         'base': base,
         'images': os.path.join(base, "images"),
@@ -158,42 +169,33 @@ def destroy_frame_actors(client, actors, ego_vehicle, rgb_cam, seg_cam):
 def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestrian_bps,
                         walker_controller_bp, rgb_camera_bp, seg_camera_bp,
                         crossing_segments, spawn_points, crosswalk_centers,
-                        scenario, dirs, frame_index, manifest_writer, map_label):
+                        scenario, dirs, frame_index, manifest_writer, map_label, bucket):
     ego_vehicle = None
     rgb_cam = None
     seg_cam = None
     actors = []
 
     try:
-        if FORCE_CROSSING_MODE == "crosswalk_only":
-            is_jaywalk = False
-        elif FORCE_CROSSING_MODE == "jaywalk_only":
-            is_jaywalk = True
-        else:
-            is_jaywalk = scenario.get('allow_jaywalk', False) and random.random() < JAYWALK_PROBABILITY
+        crossing_kind, occlusion_kind = bucket.split("_", 1)
+        is_jaywalk = crossing_kind == "jaywalk"
+        wants_occlusion = occlusion_kind == "occluded"
 
         crossing_start = crossing_end = None
 
         if is_jaywalk:
             jw_wp = find_jaywalk_waypoint(carla_map, spawn_points, crosswalk_centers,
                                            JAYWALK_CROSSWALK_EXCLUSION_RADIUS)
-            if jw_wp is not None:
-                dist = random.uniform(8.0, 15.0)
-                prev = jw_wp.previous(dist)
-                ego_transform = prev[0].transform if prev else jw_wp.transform
-                ego_transform.location.z += 0.5
-                crossing_start, crossing_end = get_full_road_crossing_segment(jw_wp)
-            elif FORCE_CROSSING_MODE == "jaywalk_only":
-                # forced jaywalk-only mode: don't silently swap to a legal
-                # crossing just because this attempt couldn't find a spot -
-                # fail the attempt instead, the outer loop will retry
+            if jw_wp is None:
+                # this image's bucket calls for jaywalking specifically -
+                # don't silently swap to a crosswalk, just fail the attempt
+                # so the plan still gets a genuine jaywalk image on retry
                 return False
-            else:
-                # couldn't find a spot far enough from every crosswalk this
-                # time, fall back to a normal legal crossing instead
-                is_jaywalk = False
-
-        if not is_jaywalk:
+            dist = random.uniform(8.0, 15.0)
+            prev = jw_wp.previous(dist)
+            ego_transform = prev[0].transform if prev else jw_wp.transform
+            ego_transform.location.z += 0.5
+            crossing_start, crossing_end = get_full_road_crossing_segment(jw_wp)
+        else:
             segment = random.choice(crossing_segments)
             ego_transform = segment['ego_transform']
             crossing_start, crossing_end = segment['start'], segment['end']
@@ -217,9 +219,8 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
 
         counts = resolve_scenario_counts(scenario, MIN_OPTIONAL_CATEGORIES_SATISFIED,
                                           REQUIRE_PEDESTRIAN, MAX_COUNT_REROLLS,
-                                          occlusion_probability=OCCLUSION_PROBABILITY)
-        has_other_actors = counts['vehicles'] + counts['cyclists_scooters'] + counts['trucks'] > 0
-        target_occlusion_percent = counts['occlusion_percent'] if has_other_actors else 0
+                                          occluded_this_image=wants_occlusion)
+        target_occlusion_percent = random.randint(*OCCLUSION_PERCENT_RANGE) if wants_occlusion else 0
 
         vehicles_list = spawn_traffic_vehicles(
             world, blueprints, ego_transform, counts['vehicles'],
@@ -262,7 +263,13 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
         achieved_occlusion_pct = 0.0
         occlusion_within_tolerance = True
 
-        if remaining_pedestrians > 0 and target_occlusion_percent > 0 and occluder_candidates:
+        if remaining_pedestrians > 0 and wants_occlusion:
+            if not occluder_candidates:
+                # this bucket needs an occluded pedestrian but nothing got
+                # spawned to occlude them with - fail and retry rather than
+                # save a plain "clear" image under an occluded label
+                return False
+
             occluded_ped, occluded_controller, achieved_occlusion_pct, occlusion_within_tolerance = place_pedestrian_for_occlusion(
                 world, pedestrian_bps, walker_controller_bp,
                 crossing_start, crossing_end, occluder_candidates,
@@ -464,7 +471,7 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
             cv2.imwrite(os.path.join(dirs['bbox_3d'], f"{image_name}_bbox_3d.png"), img_3d)
 
         manifest_writer.writerow([
-            image_name, scenario['name'], map_label, counts['pedestrians'], counts['vehicles'],
+            image_name, scenario['name'], map_label, bucket, counts['pedestrians'], counts['vehicles'],
             counts['cyclists_scooters'], counts['trucks'], target_occlusion_percent,
             f"{achieved_occlusion_pct:.1f}", occlusion_within_tolerance, is_jaywalk
         ])
@@ -525,6 +532,46 @@ def switch_map(client, map_name):
     return world
 
 
+def connect_to_server(map_name_hint=None):
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(10.0)
+    world = client.get_world()
+
+    if map_name_hint:
+        current_map = world.get_map().name.split('/')[-1]
+        if current_map != map_name_hint:
+            world = switch_map(client, map_name_hint)
+
+    settings = apply_sync_settings(world)
+    blueprints = world.get_blueprint_library()
+    actor_bps = setup_actor_blueprints(blueprints)
+    return client, world, settings, blueprints, actor_bps
+
+
+def reconnect_with_retries(map_name_hint, log_path):
+    """
+    A CARLA server crash (core dump, OOM kill, manual restart) drops the
+    client connection entirely - no amount of retrying the same call fixes
+    that. This waits and keeps trying to open a brand new connection,
+    since all progress so far (frame numbering, each scenario's remaining
+    image-type plan) is already safely on disk and doesn't depend on this
+    particular connection staying alive.
+    """
+    attempt = 0
+    while RECONNECT_MAX_ATTEMPTS is None or attempt < RECONNECT_MAX_ATTEMPTS:
+        attempt += 1
+        limit_str = f"/{RECONNECT_MAX_ATTEMPTS}" if RECONNECT_MAX_ATTEMPTS else ""
+        print(f"  connection to CARLA looks dead, retrying ({attempt}{limit_str}) "
+              f"in {RECONNECT_RETRY_DELAY_SECONDS:.0f}s - restart the server now if it crashed")
+        time.sleep(RECONNECT_RETRY_DELAY_SECONDS)
+        try:
+            return connect_to_server(map_name_hint)
+        except Exception as exc:
+            log_error(log_path, f"reconnect attempt {attempt} failed", exc)
+
+    raise RuntimeError(f"could not reconnect to CARLA after {attempt} attempts, giving up for now")
+
+
 def split_evenly(total, n):
     base = total // n
     remainder = total % n
@@ -533,10 +580,10 @@ def split_evenly(total, n):
 
 def resolve_map_chunks(number_images_to_generate):
     """
-    Splits a scenario's image count across MAP_ROTATION if one is set, so
-    the same weather scenario gets built from several different maps
-    instead of repeating the same streets over and over. Returns a list
-    of (map_name_or_None, image_count) pairs; map_name is None when no
+    Splits a count of images across MAP_ROTATION if one is set, so the
+    same weather scenario gets built from several different maps instead
+    of repeating the same streets over and over. Returns a list of
+    (map_name_or_None, image_count) pairs; map_name is None when no
     rotation is configured, meaning "don't touch the current map".
     """
     if not MAP_ROTATION:
@@ -591,57 +638,57 @@ def write_run_summary(manifest_path, summary_path):
 
 
 def main(cli_args=None):
-    global OUTPUT_DIR
-
     if cli_args is None:
         cli_args = parse_args()
-    apply_cli_overrides(cli_args)
-    OUTPUT_DIR = resolve_output_dir()
 
-    client = carla.Client('localhost', 2000)
-    client.set_timeout(10.0)
-    world = client.get_world()
+    active_split = resolve_split(cli_args.mode)
+    if cli_args.count is not None:
+        for scenario in SCENARIOS:
+            scenario['number_images_to_generate'] = cli_args.count
 
-    if not MAP_ROTATION and MAP_NAME:
-        current_map = world.get_map().name.split('/')[-1]
-        if current_map != MAP_NAME:
-            world = switch_map(client, MAP_NAME)
+    output_dir = cli_args.resume or resolve_output_dir(active_split, cli_args.mode)
+    os.makedirs(output_dir, exist_ok=True)
 
-    settings = apply_sync_settings(world)
-    blueprints = world.get_blueprint_library()
-    vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = setup_actor_blueprints(blueprints)
+    client, world, settings, blueprints, actor_bps = connect_to_server(MAP_NAME if not MAP_ROTATION else None)
+    vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = actor_bps
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    manifest_path = os.path.join(OUTPUT_DIR, "manifest.csv")
+    manifest_path = os.path.join(output_dir, "manifest.csv")
     manifest_is_new = not os.path.exists(manifest_path)
     manifest_file = open(manifest_path, 'a', newline='')
     manifest_writer = csv.writer(manifest_file)
     if manifest_is_new:
         manifest_writer.writerow([
-            "image_name", "scenario", "map", "pedestrians", "vehicles",
+            "image_name", "scenario", "map", "bucket", "pedestrians", "vehicles",
             "cyclists_scooters", "trucks", "target_occlusion_percent",
             "achieved_occlusion_percent", "occlusion_within_tolerance", "is_jaywalking"
         ])
 
-    log_path = os.path.join(OUTPUT_DIR, "run_log.txt")
+    log_path = os.path.join(output_dir, "run_log.txt")
 
     try:
         for scenario in SCENARIOS:
-            dirs = scenario_dirs(scenario['name'])
+            dirs = scenario_dirs(output_dir, scenario['name'])
             frame_index = next_frame_index(dirs['images'])
-            map_chunks = resolve_map_chunks(scenario['number_images_to_generate'])
+            plan = load_or_build_plan(
+                dirs['base'], scenario['number_images_to_generate'], active_split,
+                scenario.get('allow_jaywalk', False), scenario.get('allow_occlusion', False)
+            )
+
+            if not plan:
+                print(f"\nscenario '{scenario['name']}': plan already complete, skipping")
+                continue
+
+            map_chunks = resolve_map_chunks(len(plan))
 
             for map_name, chunk_target in map_chunks:
-                if chunk_target <= 0:
+                if chunk_target <= 0 or not plan:
                     continue
 
-                if map_name:
-                    current_map_name = world.get_map().name.split('/')[-1]
-                    if current_map_name != map_name:
-                        world = switch_map(client, map_name)
-                        settings = apply_sync_settings(world)
-                        blueprints = world.get_blueprint_library()
-                        vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = setup_actor_blueprints(blueprints)
+                if map_name and world.get_map().name.split('/')[-1] != map_name:
+                    world = switch_map(client, map_name)
+                    settings = apply_sync_settings(world)
+                    blueprints = world.get_blueprint_library()
+                    vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = setup_actor_blueprints(blueprints)
 
                 carla_map, crossing_segments, crosswalk_centers, spawn_points = scan_map_geometry(world)
                 map_label = map_name or world.get_map().name.split('/')[-1]
@@ -660,38 +707,64 @@ def main(cli_args=None):
                     except Exception:
                         pass
 
-                generated = 0
+                chunk_generated = 0
                 attempts = 0
                 # a hard ceiling so one broken chunk (bad map, no valid
                 # spawns, etc) can't spin forever without ever finishing
                 max_total_attempts = chunk_target * 3 + 20
 
-                print(f"\nscenario '{scenario['name']}' on {map_label}: "
-                      f"target {chunk_target} images, resuming at frame {frame_index}")
+                print(f"\nscenario '{scenario['name']}' on {map_label}: target {chunk_target} images "
+                      f"({len(plan)} total remaining in plan), resuming at frame {frame_index}")
 
-                while generated < chunk_target and attempts < max_total_attempts:
+                while chunk_generated < chunk_target and plan and attempts < max_total_attempts:
                     attempts += 1
+                    bucket = plan[0]
                     try:
                         saved = generate_one_frame(
                             client, world, carla_map, blueprints, vehicle_bp, pedestrian_bps,
                             walker_controller_bp, rgb_camera_bp, seg_camera_bp,
                             crossing_segments, spawn_points, crosswalk_centers,
-                            scenario, dirs, frame_index, manifest_writer, map_label
+                            scenario, dirs, frame_index, manifest_writer, map_label, bucket
                         )
                         manifest_file.flush()
                         if saved:
-                            generated += 1
+                            consume_plan_item(dirs['base'], plan)
+                            chunk_generated += 1
                             frame_index += 1
-                            if generated % 25 == 0:
-                                print(f"  {generated}/{chunk_target}")
+                            if chunk_generated % 25 == 0:
+                                print(f"  {chunk_generated}/{chunk_target}")
+
+                        # settle time between frames even on success - spawning
+                        # the next ego vehicle immediately after a full batch
+                        # destroy, with no breathing room, is a real source of
+                        # spawn-collision failures and engine instability
+                        for _ in range(POST_DESTROY_SETTLE_TICKS):
+                            world.tick()
+                        time.sleep(POST_DESTROY_SETTLE_SECONDS)
+
                     except Exception as exc:
                         log_error(log_path, f"scenario={scenario['name']} map={map_label} "
-                                             f"frame_index={frame_index} attempt={attempts}", exc)
-                        print(f"  frame failed, logged to {log_path}, continuing")
-                        time.sleep(0.5)
+                                             f"bucket={bucket} frame_index={frame_index} attempt={attempts}", exc)
 
-                if generated < chunk_target:
-                    print(f"  only got {generated}/{chunk_target} for '{scenario['name']}' on {map_label} "
+                        if looks_like_connection_error(exc):
+                            try:
+                                client, world, settings, blueprints, actor_bps = reconnect_with_retries(map_label, log_path)
+                                vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = actor_bps
+                                world.set_weather(scenario['weather'])
+                                carla_map, crossing_segments, crosswalk_centers, spawn_points = scan_map_geometry(world)
+                                print("  reconnected, resuming from the same plan/frame position")
+                            except Exception as reconnect_exc:
+                                log_error(log_path, "gave up trying to reconnect", reconnect_exc)
+                                print(f"  could not reconnect to CARLA - stopping here. "
+                                      f"Nothing already saved is lost: re-run with "
+                                      f"--resume {output_dir} once the server is back up.")
+                                raise
+                        else:
+                            print(f"  frame failed, logged to {log_path}, continuing")
+                            time.sleep(0.5)
+
+                if chunk_generated < chunk_target:
+                    print(f"  only got {chunk_generated}/{chunk_target} for '{scenario['name']}' on {map_label} "
                           f"after {attempts} attempts, moving on")
     finally:
         manifest_file.close()
@@ -699,7 +772,7 @@ def main(cli_args=None):
         settings.fixed_delta_seconds = None
         world.apply_settings(settings)
 
-    write_run_summary(manifest_path, os.path.join(OUTPUT_DIR, "summary.txt"))
+    write_run_summary(manifest_path, os.path.join(output_dir, "summary.txt"))
 
 
 if __name__ == "__main__":

@@ -740,39 +740,29 @@ def get_full_road_crossing_segment(waypoint, shoulder_margin=1.5, max_lanes_each
 
 
 def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestrian=True,
-                            max_rerolls=8, occlusion_probability=1.0):
+                            max_rerolls=8, occluded_this_image=False):
     """
-    Rolls actor counts (and the occlusion target) within a scenario's
-    (min, max) ranges, re-rolling until pedestrians are present and at
-    least min_optional_satisfied of {vehicles, cyclists_scooters, trucks,
-    occlusion} are also nonzero - gives images real variety without
-    letting them go completely empty/boring. If we run out of rerolls we
-    just bump the best attempt up to clear the bar instead of giving up.
+    Rolls actor counts within a scenario's (min, max) ranges, re-rolling
+    until pedestrians are present and at least min_optional_satisfied of
+    {vehicles, cyclists_scooters, trucks, occluded_this_image} are also
+    true - gives images real variety without letting them go completely
+    empty/boring. If we run out of rerolls we just bump the best attempt
+    up to clear the bar instead of giving up.
 
-    occlusion_probability gates whether occlusion_percent gets rolled from
-    its range at all for a given image (1.0 = always roll it, 0.0 = never
-    occluded) - this is what actually controls how many images come out
-    occluded vs clear, independent of what the percentage range itself is.
+    occluded_this_image comes from the exact image-type plan (see
+    image_plan.py), not from anything rolled in here - this function only
+    ever decides pedestrian/vehicle/cyclist/truck counts.
     """
     def roll(key):
         lo, hi = scenario[key]
         return random.randint(lo, hi)
-
-    def roll_occlusion():
-        if random.random() > occlusion_probability:
-            return 0
-        # the gate just decided "this image gets occluded" - don't let the
-        # roll itself undo that by drawing 0 out of a range like (0, 75)
-        lo, hi = scenario['occlusion_percent']
-        lo = max(lo, 1)
-        return random.randint(lo, hi) if lo <= hi else hi
 
     def count_satisfied(counts):
         return sum([
             counts['vehicles'] > 0,
             counts['cyclists_scooters'] > 0,
             counts['trucks'] > 0,
-            counts['occlusion_percent'] > 0,
+            occluded_this_image,
         ])
 
     best_counts = None
@@ -782,7 +772,6 @@ def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestri
             'vehicles': roll('vehicles'),
             'cyclists_scooters': roll('cyclists_scooters'),
             'trucks': roll('trucks'),
-            'occlusion_percent': roll_occlusion(),
         }
         if require_pedestrian and counts['pedestrians'] < 1:
             continue
@@ -791,7 +780,7 @@ def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestri
         if best_counts is None:
             best_counts = counts
 
-    counts = best_counts or {'pedestrians': 1, 'vehicles': 0, 'cyclists_scooters': 0, 'trucks': 0, 'occlusion_percent': 0}
+    counts = best_counts or {'pedestrians': 1, 'vehicles': 0, 'cyclists_scooters': 0, 'trucks': 0}
     if require_pedestrian and counts['pedestrians'] < 1:
         counts['pedestrians'] = 1
 
