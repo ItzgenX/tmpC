@@ -58,8 +58,10 @@ def compute_bbox_overlap_fraction(target_bbox, occluder_bboxes, grid=64):
 
 
 def camera_forward_depth(world_to_camera, location):
-    # same depth axis project_vertices_to_2d uses to drop anything behind
-    # the camera - lets us tell which of two boxes is actually nearer
+    """
+    Same depth axis project_vertices_to_2d uses to drop anything behind
+    the camera - lets us tell which of two boxes is actually nearer.
+    """
     world_point = np.array([location.x, location.y, location.z, 1.0])
     p_camera = np.dot(world_to_camera, world_point)
     return p_camera[0]
@@ -68,10 +70,12 @@ def camera_forward_depth(world_to_camera, location):
 def find_best_occlusion_transform(pedestrian_bb, crossing_start, crossing_end,
                                    occluder_actors, camera, target_percent,
                                    samples=25, progress_range=(0.15, 0.85), grid=64):
-    # walks the crossing line looking for the spot whose bbox overlap with
-    # the occluders is closest to target_percent. only counts an occluder
-    # if it's actually nearer the camera than the pedestrian - otherwise
-    # it's behind them and doesn't block anything
+    """
+    Walks the crossing line looking for the spot whose bbox overlap with
+    the occluders is closest to target_percent. Only counts an occluder
+    if it's actually nearer the camera than the pedestrian - otherwise
+    it's behind them and doesn't block anything.
+    """
     best = None
     best_diff = None
     lo, hi = progress_range
@@ -122,18 +126,22 @@ def place_pedestrian_for_occlusion(world, pedestrian_bps, walker_controller_bp,
                                     camera, target_percent, samples=25,
                                     progress_range=(0.15, 0.85), grid=64,
                                     tolerance_percent=12.0, speed_range=(0.9, 1.6)):
-    # spawns a pedestrian, searches for the best occlusion spot on the
-    # crossing line, repositions, then starts walking - controller only
-    # gets attached after the position is final
+    """
+    Spawns a pedestrian, searches for the best occlusion spot on the
+    crossing line, repositions, then starts walking - controller only
+    gets attached after the position is final.
+    """
     pedestrian, start_loc, _, _ = spawn_pedestrian_only(
         world, pedestrian_bps, crossing_start, crossing_end, progress=0.5
     )
     if not pedestrian:
         return None, None, 0.0, False
 
-    # the search always assumes walking crossing_start -> crossing_end
-    # (that's the fixed yaw it scores candidates with), so once we've
-    # repositioned onto the search's line, the walk target follows suit
+    """
+    the search always assumes walking crossing_start -> crossing_end
+    (that's the fixed yaw it scores candidates with), so once we've
+    repositioned onto the search's line, the walk target follows suit
+    """
     forward_yaw = math.degrees(math.atan2(crossing_end.y - crossing_start.y, crossing_end.x - crossing_start.x))
 
     if not occluder_candidates:
