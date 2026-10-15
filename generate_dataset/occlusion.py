@@ -68,17 +68,10 @@ def camera_forward_depth(world_to_camera, location):
 def find_best_occlusion_transform(pedestrian_bb, crossing_start, crossing_end,
                                    occluder_actors, camera, target_percent,
                                    samples=25, progress_range=(0.15, 0.85), grid=64):
-    """
-    Searches along the crossing line for the pedestrian position whose
-    projected bbox overlap with the (already-placed) occluder_actors best
-    matches target_percent. Returns (transform, achieved_percent, progress_t)
-    or None if nothing projects into frame.
-
-    Only counts an occluder at a candidate point if it's actually nearer to
-    the camera than the pedestrian would be there - a box overlapping on
-    screen means nothing if the "occluder" is actually behind the
-    pedestrian, it has to be in front to really block the view.
-    """
+    # walks the crossing line looking for the spot whose bbox overlap with
+    # the occluders is closest to target_percent. only counts an occluder
+    # if it's actually nearer the camera than the pedestrian - otherwise
+    # it's behind them and doesn't block anything
     best = None
     best_diff = None
     lo, hi = progress_range
@@ -129,25 +122,9 @@ def place_pedestrian_for_occlusion(world, pedestrian_bps, walker_controller_bp,
                                     camera, target_percent, samples=25,
                                     progress_range=(0.15, 0.85), grid=64,
                                     tolerance_percent=12.0, speed_range=(0.9, 1.6)):
-    """
-    One call that does the whole occlusion-targeting job: spawns a
-    pedestrian on the crossing line, searches for the spot along it that
-    best matches target_percent against whatever vehicles/trucks/cyclists
-    are already in the scene, repositions the pedestrian there, and only
-    then starts its AI walker controller.
-
-    That ordering matters: the controller never gets attached until the
-    pedestrian is at its final transform. Teleporting an actor that
-    already has a live walker controller navigating it is a known way to
-    desync CARLA's crowd-nav state - this avoids ever doing that.
-
-    This is the main control point if you want to tune how occlusion
-    generation behaves - samples/progress_range/grid affect how hard the
-    search tries, tolerance_percent only affects what gets reported back.
-
-    Returns (pedestrian, controller, achieved_percent, within_tolerance).
-    pedestrian is None if nothing could even be spawned.
-    """
+    # spawns a pedestrian, searches for the best occlusion spot on the
+    # crossing line, repositions, then starts walking - controller only
+    # gets attached after the position is final
     pedestrian, start_loc, _, _ = spawn_pedestrian_only(
         world, pedestrian_bps, crossing_start, crossing_end, progress=0.5
     )

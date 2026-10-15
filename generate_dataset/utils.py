@@ -657,18 +657,10 @@ def jitter_along_lane(waypoint, lateral_jitter=0.0, forward_jitter=0.0):
 
 
 def find_lane_waypoint(carla_map, loc, prefer_bike_lane=False, max_bike_lane_dist=4.0):
-    """
-    Tries a dedicated bike lane first when asked for one, falls back to
-    the ordinary driving lane if the map doesn't have one there.
-
-    project_to_road=True snaps to the *nearest* waypoint of that lane_type
-    anywhere on the map, with no distance cap. On a map with no real bike
-    lane near `loc`, that can snap the cyclist onto a bike lane meters
-    away that runs alongside - or is tagged over - a sidewalk, which is
-    what was putting cyclists/scooters visibly on the footpath. Rejecting
-    a bike-lane match that isn't actually close to the requested spot and
-    falling back to the driving lane instead fixes that.
-    """
+    # tries a bike lane first, falls back to the driving lane. get_waypoint
+    # snaps to the nearest match with no distance cap, so on a map with no
+    # real bike lane nearby it could grab one meters away next to a
+    # sidewalk - the distance check below rejects that and falls back
     if prefer_bike_lane:
         bike_wp = carla_map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Biking)
         if bike_wp and bike_wp.transform.location.distance(loc) <= max_bike_lane_dist:
