@@ -104,8 +104,11 @@ For every frame, `generate_scenarios.py` does roughly this:
    and a jaywalker are never allowed to appear in the same frame. If no
    such spot can be found this attempt, it fails and retries rather than
    silently substituting a crosswalk image.
-3. **Spawn the ego vehicle** at an approach point before that crossing,
-   let it settle, freeze its physics.
+3. **Reposition the ego vehicle** to an approach point before that
+   crossing. The ego vehicle and both cameras are spawned only *once* per
+   map chunk (not per frame — see §8 point 5) and reused across every
+   frame in it; each frame just teleports the already-spawned ego vehicle
+   to this frame's approach point and lets it settle.
 4. **Roll actor counts** for this image — pedestrians, cars, trucks,
    cyclists/scooters/motorcycles — from each scenario's `(min, max)`
    ranges (see §5.3 for the acceptance rule that keeps this from
@@ -346,6 +349,16 @@ scenario count but get detected and labeled separately. Edit any list
 freely — an ID your content pack doesn't have is just skipped at spawn
 time, not fatal.
 
+Cyclists/scooters/motorcycles try a dedicated `LaneType.Biking` waypoint
+near their rolled spawn point first. CARLA's waypoint lookup snaps to the
+*nearest* lane of that type anywhere on the map with no distance cap, so
+on a map with no real bike lane nearby it could previously snap one onto
+a bike lane meters away that runs alongside (or is tagged over) a
+sidewalk — visibly placing a cyclist on the footpath. `find_lane_waypoint`
+in `utils.py` now rejects a bike-lane match further than
+`max_bike_lane_dist` (4.0m) from the rolled point and falls back to the
+ordinary driving lane instead.
+
 ### 5.6 Crash / disconnect resilience
 
 ```python
@@ -477,6 +490,23 @@ things now address this:
    core dump still happens, it's worth checking whether it only ever
    occurs on `*_occluded` images specifically (which would point at
    something else occlusion-related) versus any image type.
+
+5. **Ego vehicle and both cameras are no longer respawned every frame.**
+   The RGB and semantic segmentation cameras run at 4K
+   (3840x2160). Spawning and destroying a pair of 4K camera sensors (plus
+   the ego vehicle they're attached to) on every single frame leaks
+   native-side sensor/render resources in CARLA, and is what was causing
+   the client to core-dump after roughly 20-25 images regardless of
+   anything else in this list — the server stayed up throughout, which is
+   the signature of this specific leak. Now the ego vehicle and both
+   cameras are spawned exactly once per map chunk (both cameras start
+   `listen()`-ing immediately and keep listening for the whole chunk)
+   and reused for every frame in it: each frame just teleports the ego
+   vehicle to its next approach point and drains/refills the camera
+   queues, never respawning the sensors themselves. They're only
+   destroyed when the chunk ends, the map switches, or a reconnect
+   happens. This is what makes runs of 1000-2000+ images viable instead
+   of crashing every few dozen frames.
 
 None of this can make Python relaunch a CarlaUE4 process that's actually
 dead — something (you, or a supervisor/systemd unit) still has to restart
