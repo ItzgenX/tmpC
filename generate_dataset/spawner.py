@@ -135,10 +135,7 @@ def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_d
             if not wp:
                 continue
 
-            """
-            jitter along the lane's own right-vector so we stay parallel
-            to the road instead of clipping sideways off it on a curve
-            """
+            # jitter along the lane's right vector, stays parallel on curves
             candidate_loc = jitter_along_lane(wp, lateral_jitter=random.uniform(-0.4, 0.4))
             candidate_loc.z += 0.5
             if too_close(candidate_loc):
@@ -165,12 +162,7 @@ def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_d
 
 
 def spawn_pedestrian_only(world, pedestrian_bps, crossing_start, crossing_end, progress=None):
-    """
-    Just the actor, no walker controller yet - lets a caller (occlusion
-    search) reposition via set_transform before the controller exists.
-    Teleporting after the controller's attached corrupts CARLA's
-    crowd-nav state and was the cause of the client core dumps.
-    """
+    # actor only, no controller yet, so the occlusion search can reposition first
     if progress is None:
         progress = random.uniform(0.05, 0.35)
 
@@ -202,10 +194,7 @@ def spawn_pedestrian_only(world, pedestrian_bps, crossing_start, crossing_end, p
 
 def start_walker_controller(world, walker_controller_bp, pedestrian, start_loc, target_loc, yaw,
                              speed_range=(0.9, 1.6)):
-    """
-    Pedestrian needs to already be at its final transform - no
-    set_transform calls on it after this.
-    """
+    # pedestrian must already be at its final transform
     controller = None
     speed = random.uniform(*speed_range)
     try:
@@ -231,12 +220,7 @@ def start_walker_controller(world, walker_controller_bp, pedestrian, start_loc, 
 def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
                                crossing_start, crossing_end,
                                progress=None, speed_range=(0.9, 1.6)):
-    """
-    Spawn + start walking immediately - for the normal case where
-    nothing needs to reposition the pedestrian afterward. Works the
-    same whether the line comes from a crosswalk polygon or a plain
-    road width (jaywalk case), since it's just two points either way.
-    """
+    # spawn and start walking immediately, no repositioning needed
     pedestrian, start_loc, target_loc, yaw = spawn_pedestrian_only(
         world, pedestrian_bps, crossing_start, crossing_end, progress=progress
     )

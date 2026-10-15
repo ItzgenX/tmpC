@@ -3,10 +3,7 @@ import os
 import random
 
 
-"""
-The four buckets every scenario's images get split across. Keys must
-match exactly - "crosswalk"/"jaywalk" x "clear"/"occluded".
-"""
+# the four buckets every scenario's images split across
 BUCKETS = ["crosswalk_clear", "crosswalk_occluded", "jaywalk_clear", "jaywalk_occluded"]
 
 
@@ -27,10 +24,7 @@ def allocate_counts(n, split_pct):
 
 
 def build_image_plan(n, split_pct, allow_jaywalk, allow_occlusion):
-    """
-    Shuffled list of n bucket labels. A disallowed bucket's quota folds
-    into its nearest allowed counterpart instead of getting dropped.
-    """
+    # shuffled list of n bucket labels, disallowed buckets fold into allowed ones
     counts = allocate_counts(n, split_pct)
     merged = {b: 0 for b in BUCKETS}
 
@@ -54,10 +48,7 @@ def plan_path(scenario_dir):
 
 
 def load_or_build_plan(scenario_dir, n, split_pct, allow_jaywalk, allow_occlusion):
-    """
-    Resumes from disk if a plan file exists - including an empty one,
-    which means this scenario already finished, not "build a new one".
-    """
+    # resumes from disk if present; an empty file means already finished
     path = plan_path(scenario_dir)
     if os.path.exists(path):
         with open(path) as f:

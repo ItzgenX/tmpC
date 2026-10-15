@@ -43,11 +43,7 @@ from occlusion import place_pedestrian_for_occlusion
 from image_plan import load_or_build_plan, consume_plan_item
 
 
-"""
-Shortcut for the three "every image is one type" batches. Percentages
-within each still follow the same clear/occluded split as the default,
-just restricted to one crossing type.
-"""
+# shortcuts for the three "one type only" batches
 MODE_SPLITS = {
     "crosswalk_only": {"crosswalk_clear": 50, "crosswalk_occluded": 50, "jaywalk_clear": 0, "jaywalk_occluded": 0},
     "jaywalk_only": {"crosswalk_clear": 0, "crosswalk_occluded": 0, "jaywalk_clear": 50, "jaywalk_occluded": 50},
@@ -65,22 +61,17 @@ def parse_args():
     parser.add_argument(
         "--mode", choices=["mixed", "crosswalk_only", "jaywalk_only", "occlusion_only"],
         default="mixed",
-        help="mixed (default): the exact split from IMAGE_TYPE_SPLIT in scenario_config.py "
-             "(25/25/25/25 by default). crosswalk_only/jaywalk_only/occlusion_only: restrict "
-             "to that type for this run only - doesn't touch scenario_config.py."
+        help="mixed (default): the split from IMAGE_TYPE_SPLIT in scenario_config.py. "
+             "crosswalk_only/jaywalk_only/occlusion_only: restrict to that type, this run only."
     )
     parser.add_argument(
         "--count", type=int, default=None,
-        help="override number_images_to_generate for every scenario in SCENARIOS "
-             "(e.g. --count 50 means 50 images for EACH weather scenario, not 50 total)."
+        help="override number_images_to_generate for every scenario (per scenario, not total)."
     )
     parser.add_argument(
         "--resume", type=str, default=None,
-        help="path to a previous run's output folder, or 'latest' to pick the most "
-             "recently modified one under dataset_scenarios/ automatically. Continues "
-             "that run instead of starting a fresh one - frame numbering and each "
-             "scenario's remaining image-type plan both resume from what's on disk, so "
-             "a run interrupted by a crash doesn't lose progress."
+        help="path to a previous run folder, or 'latest' for the most recent one. "
+             "Resumes exactly where that run left off."
     )
     return parser.parse_args()
 
@@ -97,7 +88,7 @@ def looks_like_connection_error(exc):
 
 
 def resolve_latest_run_dir():
-    # most recently modified folder under dataset_scenarios/, for --resume latest
+    # most recently modified folder under dataset_scenarios/
     if not os.path.isdir(OUTPUT_BASE_DIR):
         return None
     candidates = [
@@ -127,10 +118,7 @@ def scenario_dirs(output_dir, scenario_name):
 
 
 def next_frame_index(images_dir):
-    """
-    Resumes numbering from whatever's already on disk instead of starting
-    over at 0 and overwriting a previous run's images.
-    """
+    # resumes numbering from what's already on disk
     if not os.path.isdir(images_dir):
         return 0
     nums = []
@@ -150,10 +138,7 @@ def log_error(log_path, context, exc):
 
 
 def destroy_frame_actors(client, actors):
-    """
-    Ego vehicle + cameras live outside this, reused per chunk now.
-    Just traffic/pedestrians/controllers get cleared every frame.
-    """
+    # ego vehicle and cameras live outside this now, reused per chunk
     for actor in actors:
         if actor and actor.is_alive and hasattr(actor, 'type_id') and actor.type_id.startswith('controller.'):
             actor.stop()
@@ -164,10 +149,7 @@ def destroy_frame_actors(client, actors):
 
 
 def spawn_ego_and_cameras(world, vehicle_bp, rgb_camera_bp, seg_camera_bp, ego_transform):
-    """
-    One ego + two cameras per map chunk, reused every frame after this.
-    Cameras start listening here and stay listening for the whole chunk.
-    """
+    # one ego + two cameras per chunk, reused every frame
     ego_vehicle = spawn_actor(world, vehicle_bp, ego_transform)
     if not ego_vehicle:
         return None, None, None, None, None
@@ -207,10 +189,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
                         image_queue, seg_queue,
                         crossing_segments, spawn_points, crosswalk_centers,
                         scenario, dirs, frame_index, manifest_writer, map_label, bucket):
-    """
-    ego_vehicle/rgb_cam/seg_cam belong to the caller - just reposition
-    and read from them here, never spawn/destroy.
-    """
+    # ego_vehicle/rgb_cam/seg_cam belong to the caller, just reposition/read here
     actors = []
 
     try:
@@ -224,10 +203,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
             jw_wp = find_jaywalk_waypoint(carla_map, spawn_points, crosswalk_centers,
                                            JAYWALK_CROSSWALK_EXCLUSION_RADIUS)
             if jw_wp is None:
-                """
-                don't fall back to a crosswalk - fail and retry so this
-                bucket still gets an actual jaywalk image
-                """
+                # fail and retry, don't fall back to a crosswalk
                 return False
             dist = random.uniform(8.0, 15.0)
             prev = jw_wp.previous(dist)
@@ -273,10 +249,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
         )
         actors.extend(trucks_list)
 
-        """
-        cyclists/scooters go last so they can be kept clear of trucks -
-        a truck shouldn't spawn right on top of a bike lane in real traffic
-        """
+        # cyclists/scooters go last, kept clear of trucks
         cyclists_list = spawn_traffic_vehicles(
             world, blueprints, ego_transform, counts['cyclists_scooters'],
             CYCLIST_SCOOTER_SPAWN_DISTANCE_MIN, CYCLIST_SCOOTER_SPAWN_DISTANCE_MAX,
@@ -295,10 +268,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
 
         if remaining_pedestrians > 0 and wants_occlusion:
             if not occluder_candidates:
-                """
-                nothing spawned to occlude with, retry instead of
-                saving a clear image under an occluded label
-                """
+                # nothing to occlude with, retry
                 return False
 
             occluded_ped, occluded_controller, achieved_occlusion_pct, occlusion_within_tolerance = place_pedestrian_for_occlusion(
@@ -316,7 +286,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
                 remaining_pedestrians -= 1
 
             if achieved_occlusion_pct < OCCLUSION_MIN_ACHIEVED_PERCENT:
-                # hard floor - not actually occluded enough, retry
+                # not occluded enough, retry
                 return False
 
             if OCCLUSION_STRICT and not occlusion_within_tolerance:
@@ -397,10 +367,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
         yolo_annotations = []
         valid_detections = []
 
-        """
-        cyclists/scooters get their own pass below, skip them here
-        so they don't get double-counted as "Vehicle" too
-        """
+        # cyclists/scooters get their own pass below, skip here
         vehicle_results = get_all_vehicle_bboxes(world, rgb_cam, max_distance=MAX_RENDER_DISTANCE)
         for v_res in vehicle_results:
             actor_obj = v_res['actor_obj']
@@ -513,7 +480,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
         return True
 
     finally:
-        # runs whether we saved, skipped, or blew up - keeps actors from piling up
+        # always runs, keeps actors from piling up
         destroy_frame_actors(client, actors)
 
 
@@ -582,14 +549,7 @@ def connect_to_server(map_name_hint=None):
 
 
 def reconnect_with_retries(map_name_hint, log_path):
-    """
-    A CARLA server crash (core dump, OOM kill, manual restart) drops the
-    client connection entirely - no amount of retrying the same call fixes
-    that. This waits and keeps trying to open a brand new connection,
-    since all progress so far (frame numbering, each scenario's remaining
-    image-type plan) is already safely on disk and doesn't depend on this
-    particular connection staying alive.
-    """
+    # all progress is already on disk, safe to keep retrying a dead connection
     attempt = 0
     while RECONNECT_MAX_ATTEMPTS is None or attempt < RECONNECT_MAX_ATTEMPTS:
         attempt += 1
@@ -612,10 +572,7 @@ def split_evenly(total, n):
 
 
 def resolve_map_chunks(number_images_to_generate):
-    """
-    Splits the count across MAP_ROTATION maps if set, otherwise one
-    chunk on the current map.
-    """
+    # splits across MAP_ROTATION maps if set, else one chunk on the current map
     if not MAP_ROTATION:
         return [(None, number_images_to_generate)]
     counts = split_evenly(number_images_to_generate, len(MAP_ROTATION))
@@ -739,11 +696,7 @@ def main(cli_args=None):
                     except Exception:
                         pass
 
-                """
-                one ego + cameras per chunk, reused every frame - respawning
-                the 4K cams per frame was what core-dumped the client around
-                frame 20-25
-                """
+                # one ego + cameras per chunk, reused every frame (fixes the core dump)
                 ego_vehicle, rgb_cam, seg_cam, image_queue, seg_queue = spawn_ego_and_cameras(
                     world, vehicle_bp, rgb_camera_bp, seg_camera_bp, crossing_segments[0]['ego_transform']
                 )
