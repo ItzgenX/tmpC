@@ -135,15 +135,8 @@ def log_error(log_path, context, exc):
 
 
 def destroy_frame_actors(client, actors):
-    # the ego vehicle and both cameras are no longer in here - they're
-    # spawned once per map chunk and reused across every frame in it (see
-    # spawn_ego_and_cameras/destroy_ego_and_cameras) instead of being
-    # respawned every single frame, which was leaking native-side sensor
-    # resources and causing a core dump after ~20-25 images. Everything
-    # else here - traffic, pedestrians, and walker AI controllers (which
-    # are attached to their pedestrian and were previously getting skipped
-    # here, which is what caused actors to pile up run after run) - still
-    # gets destroyed every frame via the batch destroy below.
+    # ego vehicle + cameras live outside this, reused per chunk now.
+    # just traffic/pedestrians/controllers get cleared every frame.
     for actor in actors:
         if actor and actor.is_alive and hasattr(actor, 'type_id') and actor.type_id.startswith('controller.'):
             actor.stop()
@@ -154,14 +147,8 @@ def destroy_frame_actors(client, actors):
 
 
 def spawn_ego_and_cameras(world, vehicle_bp, rgb_camera_bp, seg_camera_bp, ego_transform):
-    """
-    Spawns the ego vehicle and both cameras once per map chunk, not once
-    per frame. Returns (ego_vehicle, rgb_cam, seg_cam, image_queue,
-    seg_queue), or (None, None, None, None, None) if the ego vehicle
-    couldn't be spawned. Both cameras start listening immediately and
-    keep listening for the whole chunk - generate_one_frame just drains
-    and refills the queues each frame instead of re-subscribing.
-    """
+    # one ego + two cameras per map chunk, reused every frame after this.
+    # cameras start listening here and stay listening for the whole chunk.
     ego_vehicle = spawn_actor(world, vehicle_bp, ego_transform)
     if not ego_vehicle:
         return None, None, None, None, None
@@ -201,10 +188,8 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
                         image_queue, seg_queue,
                         crossing_segments, spawn_points, crosswalk_centers,
                         scenario, dirs, frame_index, manifest_writer, map_label, bucket):
-    # ego_vehicle/rgb_cam/seg_cam are owned by the caller (one per map
-    # chunk, reused across frames) - this function repositions the ego
-    # vehicle and drains/refills the camera queues, but never spawns or
-    # destroys any of the three.
+    # ego_vehicle/rgb_cam/seg_cam belong to the caller - just reposition
+    # and read from them here, never spawn/destroy
     actors = []
 
     try:
@@ -218,9 +203,8 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
             jw_wp = find_jaywalk_waypoint(carla_map, spawn_points, crosswalk_centers,
                                            JAYWALK_CROSSWALK_EXCLUSION_RADIUS)
             if jw_wp is None:
-                # this image's bucket calls for jaywalking specifically -
-                # don't silently swap to a crosswalk, just fail the attempt
-                # so the plan still gets a genuine jaywalk image on retry
+                # don't fall back to a crosswalk - fail and retry so this
+                # bucket still gets an actual jaywalk image
                 return False
             dist = random.uniform(8.0, 15.0)
             prev = jw_wp.previous(dist)
@@ -286,9 +270,8 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
 
         if remaining_pedestrians > 0 and wants_occlusion:
             if not occluder_candidates:
-                # this bucket needs an occluded pedestrian but nothing got
-                # spawned to occlude them with - fail and retry rather than
-                # save a plain "clear" image under an occluded label
+                # nothing spawned to occlude with, retry instead of
+                # saving a clear image under an occluded label
                 return False
 
             occluded_ped, occluded_controller, achieved_occlusion_pct, occlusion_within_tolerance = place_pedestrian_for_occlusion(
@@ -306,16 +289,11 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
                 remaining_pedestrians -= 1
 
             if achieved_occlusion_pct < OCCLUSION_MIN_ACHIEVED_PERCENT:
-                # hard floor, always enforced: this bucket means the
-                # pedestrian has to actually be occluded in the saved
-                # image, not just "we tried" - a miss (or no spawn at
-                # all) gets retried rather than saved under a false label
+                # hard floor - not actually occluded enough, retry
                 return False
 
             if OCCLUSION_STRICT and not occlusion_within_tolerance:
-                # cleared the floor above but still didn't land close to
-                # its own rolled target - don't save it, retry with a
-                # fresh roll instead
+                # missed its own target by too much, retry
                 return False
 
         for _ in range(remaining_pedestrians):
@@ -329,9 +307,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
                 if controller:
                     actors.append(controller)
 
-        # purely background people walking the footpath, never into the
-        # road - separate from (and doesn't affect) the crossing/occlusion
-        # pedestrian(s) above, just makes the street look busier
+        # extra background people on the footpath, not part of the crossing
         if SPAWN_SIDEWALK_PEDESTRIANS:
             for _ in range(random.randint(*SIDEWALK_PEDESTRIAN_COUNT_RANGE)):
                 sidewalk_ped, _ = spawn_pedestrian_on_sidewalk(
@@ -345,9 +321,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
         for _ in range(warmup_ticks):
             world.tick()
 
-        # cameras have been listening since the chunk started - drop
-        # whatever's queued from before this frame's warmup so we don't
-        # grab a stale image left over from the previous frame
+        # clear out stale frames queued from before this warmup
         while not image_queue.empty():
             image_queue.get()
         while not seg_queue.empty():
@@ -396,8 +370,8 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
         yolo_annotations = []
         valid_detections = []
 
-        # vehicles + static parked cars, minus cyclists/scooters which get
-        # their own pass below so they aren't double-counted as "Vehicle" too
+        # cyclists/scooters get their own pass below, skip them here
+        # so they don't get double-counted as "Vehicle" too
         vehicle_results = get_all_vehicle_bboxes(world, rgb_cam, max_distance=MAX_RENDER_DISTANCE)
         for v_res in vehicle_results:
             actor_obj = v_res['actor_obj']
@@ -510,9 +484,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
         return True
 
     finally:
-        # runs whether the frame was saved, skipped, or blew up halfway
-        # through - this is what actually prevents actors from piling up.
-        # ego_vehicle/rgb_cam/seg_cam are the caller's to manage, not ours.
+        # runs whether we saved, skipped, or blew up - keeps actors from piling up
         destroy_frame_actors(client, actors)
 
 
@@ -611,13 +583,8 @@ def split_evenly(total, n):
 
 
 def resolve_map_chunks(number_images_to_generate):
-    """
-    Splits a count of images across MAP_ROTATION if one is set, so the
-    same weather scenario gets built from several different maps instead
-    of repeating the same streets over and over. Returns a list of
-    (map_name_or_None, image_count) pairs; map_name is None when no
-    rotation is configured, meaning "don't touch the current map".
-    """
+    # splits the count across MAP_ROTATION maps if set, otherwise one
+    # chunk on the current map
     if not MAP_ROTATION:
         return [(None, number_images_to_generate)]
     counts = split_evenly(number_images_to_generate, len(MAP_ROTATION))
@@ -625,12 +592,7 @@ def resolve_map_chunks(number_images_to_generate):
 
 
 def write_run_summary(manifest_path, summary_path):
-    """
-    Reads the manifest back and tallies what actually got generated, so
-    "did I get the mix I asked for" is a quick look instead of a guess -
-    total per scenario, crosswalk vs jaywalk, occluded vs clear, and the
-    spread across maps if MAP_ROTATION was used.
-    """
+    # tallies the manifest into per-scenario totals, written to summary.txt
     if not os.path.exists(manifest_path):
         return
 
@@ -739,13 +701,9 @@ def main(cli_args=None):
                     except Exception:
                         pass
 
-                # ego vehicle + both cameras are spawned ONCE here and reused
-                # for every frame in this chunk (generate_one_frame just
-                # repositions the ego vehicle each frame) instead of being
-                # respawned per frame - that per-frame respawn of a 4K camera
-                # pair was leaking native-side sensor resources and is what
-                # caused the client to core-dump after ~20-25 images. This is
-                # what actually makes a 1000-2000+ image run survive.
+                # one ego + cameras per chunk, reused every frame - respawning
+                # the 4K cams per frame was what core-dumped the client around
+                # frame 20-25
                 ego_vehicle, rgb_cam, seg_cam, image_queue, seg_queue = spawn_ego_and_cameras(
                     world, vehicle_bp, rgb_camera_bp, seg_camera_bp, crossing_segments[0]['ego_transform']
                 )
@@ -757,8 +715,7 @@ def main(cli_args=None):
                 try:
                     chunk_generated = 0
                     attempts = 0
-                    # a hard ceiling so one broken chunk (bad map, no valid
-                    # spawns, etc) can't spin forever without ever finishing
+                    # ceiling so a broken chunk can't spin forever
                     max_total_attempts = chunk_target * 3 + 20
 
                     print(f"\nscenario '{scenario['name']}' on {map_label}: target {chunk_target} images "
@@ -783,10 +740,7 @@ def main(cli_args=None):
                                 if chunk_generated % 25 == 0:
                                     print(f"  {chunk_generated}/{chunk_target}")
 
-                            # settle time between frames even on success - spawning
-                            # the next batch of traffic/pedestrians immediately after
-                            # a full destroy, with no breathing room, is a real source
-                            # of spawn-collision failures and engine instability
+                            # breathing room before the next spawn batch
                             for _ in range(POST_DESTROY_SETTLE_TICKS):
                                 world.tick()
                             time.sleep(POST_DESTROY_SETTLE_SECONDS)
@@ -797,9 +751,7 @@ def main(cli_args=None):
 
                             if looks_like_connection_error(exc):
                                 try:
-                                    # the old ego/cameras belong to the dead
-                                    # connection - don't let cleaning them up
-                                    # throw and mask the real reconnect outcome
+                                    # old ego/cams are on a dead connection, ignore cleanup errors
                                     try:
                                         destroy_ego_and_cameras(rgb_cam, seg_cam, ego_vehicle)
                                     except Exception:
@@ -834,10 +786,7 @@ def main(cli_args=None):
                         pass
     finally:
         manifest_file.close()
-        # if we got here because reconnecting failed entirely, world/settings
-        # still point at the dead connection - don't let that cleanup attempt
-        # throw a second exception that masks the real "couldn't reconnect"
-        # error with a confusing one about a closed connection
+        # don't let a dead connection's cleanup mask the real error above
         try:
             settings.synchronous_mode = False
             settings.fixed_delta_seconds = None

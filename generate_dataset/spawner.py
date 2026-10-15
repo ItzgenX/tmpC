@@ -163,18 +163,10 @@ def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_d
 
 
 def spawn_pedestrian_only(world, pedestrian_bps, crossing_start, crossing_end, progress=None):
-    """
-    Spawns just the pedestrian actor on the crossing line - no AI walker
-    controller yet. Split out from spawn_pedestrian_crossing so a caller
-    that needs to reposition the pedestrian first (the occlusion search)
-    can do that via set_transform before any controller exists. Teleporting
-    an actor that already has a live walker controller navigating it is a
-    known way to desync/corrupt CARLA's crowd-nav state and has been a
-    likely source of native-side crashes here - never do that; spawn,
-    reposition if needed, then start the controller, in that order.
-
-    Returns (pedestrian, start_loc, target_loc, yaw) or (None, None, None, None).
-    """
+    # just the actor, no walker controller yet - lets a caller (occlusion
+    # search) reposition via set_transform before the controller exists.
+    # teleporting after the controller's attached corrupts CARLA's
+    # crowd-nav state and was the cause of the client core dumps.
     if progress is None:
         progress = random.uniform(0.05, 0.35)
 
@@ -206,11 +198,8 @@ def spawn_pedestrian_only(world, pedestrian_bps, crossing_start, crossing_end, p
 
 def start_walker_controller(world, walker_controller_bp, pedestrian, start_loc, target_loc, yaw,
                              speed_range=(0.9, 1.6)):
-    """
-    Attaches and starts the AI walker controller on a pedestrian that's
-    already at its final starting transform. Don't call set_transform on
-    the pedestrian again after this - see spawn_pedestrian_only's note.
-    """
+    # pedestrian needs to already be at its final transform - no
+    # set_transform calls on it after this
     controller = None
     speed = random.uniform(*speed_range)
     try:

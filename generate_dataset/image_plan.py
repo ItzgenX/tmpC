@@ -9,12 +9,7 @@ BUCKETS = ["crosswalk_clear", "crosswalk_occluded", "jaywalk_clear", "jaywalk_oc
 
 
 def allocate_counts(n, split_pct):
-    """
-    Turns percentages into exact integer counts that sum to exactly n,
-    using largest-remainder so rounding doesn't lose or add an image.
-    split_pct values don't need to sum to exactly 100 - they're
-    normalized here - but they should be in the same ratio you intend.
-    """
+    # percentages -> exact counts summing to n, largest-remainder rounding
     total_pct = sum(split_pct.values())
     if total_pct <= 0:
         return {k: 0 for k in split_pct}
@@ -30,15 +25,8 @@ def allocate_counts(n, split_pct):
 
 
 def build_image_plan(n, split_pct, allow_jaywalk, allow_occlusion):
-    """
-    Builds a shuffled list of exactly n bucket labels for one scenario.
-
-    If a scenario doesn't allow jaywalking or doesn't allow occlusion,
-    that bucket's quota is folded into its nearest allowed counterpart
-    (jaywalk_occluded -> crosswalk_occluded if no jaywalk, -> jaywalk_clear
-    if no occlusion, -> crosswalk_clear if neither) rather than just being
-    dropped, so every one of the n images is still accounted for.
-    """
+    # shuffled list of n bucket labels. a disallowed bucket's quota folds
+    # into its nearest allowed counterpart instead of getting dropped
     counts = allocate_counts(n, split_pct)
     merged = {b: 0 for b in BUCKETS}
 
@@ -62,15 +50,8 @@ def plan_path(scenario_dir):
 
 
 def load_or_build_plan(scenario_dir, n, split_pct, allow_jaywalk, allow_occlusion):
-    """
-    Resumes a scenario's remaining plan from disk if a plan file exists
-    (this is what makes a crash/restart not throw away progress - the
-    plan file is only ever the *remaining* work, consumed and rewritten
-    one image at a time by consume_plan_item), otherwise builds a fresh
-    one. An existing file that's an empty list is a real, meaningful
-    state - it means this scenario already finished - and must be
-    returned as-is, not treated as "nothing there yet" and rebuilt.
-    """
+    # resumes from disk if a plan file exists - including an empty one,
+    # which means this scenario already finished, not "build a new one"
     path = plan_path(scenario_dir)
     if os.path.exists(path):
         with open(path) as f:
@@ -87,10 +68,6 @@ def save_plan(scenario_dir, remaining_plan):
 
 
 def consume_plan_item(scenario_dir, remaining_plan):
-    """
-    Pops the next bucket off the front and persists what's left, so a
-    crash right after this call still only re-does the image currently in
-    flight, not the whole scenario.
-    """
+    # pops + persists, so a crash only loses the image in flight
     remaining_plan.pop(0)
     save_plan(scenario_dir, remaining_plan)
