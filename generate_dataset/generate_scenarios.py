@@ -132,12 +132,56 @@ def log_error(log_path, context, exc):
         f.write(traceback.format_exc())
 
 
-def destroy_frame_actors(client, actors, ego_vehicle, rgb_cam, seg_cam):
-    # the cameras get destroyed directly (they're sensors, not batch-friendly
-    # while listening), everything else - including walker AI controllers,
-    # which are attached to their pedestrian and were previously getting
-    # skipped here, which is what caused actors to pile up run after run -
-    # goes through the batch destroy below.
+def destroy_frame_actors(client, actors):
+    # the ego vehicle and both cameras are no longer in here - they're
+    # spawned once per map chunk and reused across every frame in it (see
+    # spawn_ego_and_cameras/destroy_ego_and_cameras) instead of being
+    # respawned every single frame, which was leaking native-side sensor
+    # resources and causing a core dump after ~20-25 images. Everything
+    # else here - traffic, pedestrians, and walker AI controllers (which
+    # are attached to their pedestrian and were previously getting skipped
+    # here, which is what caused actors to pile up run after run) - still
+    # gets destroyed every frame via the batch destroy below.
+    for actor in actors:
+        if actor and actor.is_alive and hasattr(actor, 'type_id') and actor.type_id.startswith('controller.'):
+            actor.stop()
+
+    commands = [carla.command.DestroyActor(actor) for actor in actors if actor and actor.is_alive]
+    if commands:
+        client.apply_batch(commands)
+
+
+def spawn_ego_and_cameras(world, vehicle_bp, rgb_camera_bp, seg_camera_bp, ego_transform):
+    """
+    Spawns the ego vehicle and both cameras once per map chunk, not once
+    per frame. Returns (ego_vehicle, rgb_cam, seg_cam, image_queue,
+    seg_queue), or (None, None, None, None, None) if the ego vehicle
+    couldn't be spawned. Both cameras start listening immediately and
+    keep listening for the whole chunk - generate_one_frame just drains
+    and refills the queues each frame instead of re-subscribing.
+    """
+    ego_vehicle = spawn_actor(world, vehicle_bp, ego_transform)
+    if not ego_vehicle:
+        return None, None, None, None, None
+
+    for _ in range(15):
+        world.tick()
+    ego_vehicle.set_simulate_physics(False)
+
+    camera_transform = carla.Transform(carla.Location(x=0.8, z=1.8), carla.Rotation(pitch=-10))
+    rgb_cam = world.spawn_actor(rgb_camera_bp, camera_transform, attach_to=ego_vehicle)
+    seg_cam = world.spawn_actor(seg_camera_bp, camera_transform, attach_to=ego_vehicle)
+    world.tick()
+
+    image_queue = queue.Queue()
+    seg_queue = queue.Queue()
+    rgb_cam.listen(image_queue.put)
+    seg_cam.listen(seg_queue.put)
+
+    return ego_vehicle, rgb_cam, seg_cam, image_queue, seg_queue
+
+
+def destroy_ego_and_cameras(rgb_cam, seg_cam, ego_vehicle):
     if rgb_cam and rgb_cam.is_alive:
         if rgb_cam.is_listening:
             rgb_cam.stop()
@@ -146,33 +190,19 @@ def destroy_frame_actors(client, actors, ego_vehicle, rgb_cam, seg_cam):
         if seg_cam.is_listening:
             seg_cam.stop()
         seg_cam.destroy()
-
-    for actor in actors:
-        if actor and actor.is_alive and hasattr(actor, 'type_id') and actor.type_id.startswith('controller.'):
-            actor.stop()
-
-    commands = []
-    for actor in actors:
-        if not actor or not actor.is_alive:
-            continue
-        if rgb_cam and actor.id == rgb_cam.id:
-            continue
-        if seg_cam and actor.id == seg_cam.id:
-            continue
-        commands.append(carla.command.DestroyActor(actor))
     if ego_vehicle and ego_vehicle.is_alive:
-        commands.append(carla.command.DestroyActor(ego_vehicle))
-    if commands:
-        client.apply_batch(commands)
+        ego_vehicle.destroy()
 
 
-def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestrian_bps,
-                        walker_controller_bp, rgb_camera_bp, seg_camera_bp,
+def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
+                        walker_controller_bp, ego_vehicle, rgb_cam, seg_cam,
+                        image_queue, seg_queue,
                         crossing_segments, spawn_points, crosswalk_centers,
                         scenario, dirs, frame_index, manifest_writer, map_label, bucket):
-    ego_vehicle = None
-    rgb_cam = None
-    seg_cam = None
+    # ego_vehicle/rgb_cam/seg_cam are owned by the caller (one per map
+    # chunk, reused across frames) - this function repositions the ego
+    # vehicle and drains/refills the camera queues, but never spawns or
+    # destroys any of the three.
     actors = []
 
     try:
@@ -200,9 +230,9 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
             ego_transform = segment['ego_transform']
             crossing_start, crossing_end = segment['start'], segment['end']
 
-        ego_vehicle = spawn_actor(world, vehicle_bp, ego_transform)
-        if not ego_vehicle:
-            return False
+        ego_vehicle.set_transform(ego_transform)
+        for _ in range(15):
+            world.tick()
 
         lights_on = should_use_lights(scenario['weather'])
         if lights_on:
@@ -212,10 +242,6 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
                 )
             except Exception:
                 pass
-
-        for _ in range(15):
-            world.tick()
-        ego_vehicle.set_simulate_physics(False)
 
         counts = resolve_scenario_counts(scenario, MIN_OPTIONAL_CATEGORIES_SATISFIED,
                                           REQUIRE_PEDESTRIAN, MAX_COUNT_REROLLS,
@@ -251,13 +277,6 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
         actors.extend(cyclists_list)
 
         occluder_candidates = vehicles_list + trucks_list + cyclists_list
-
-        camera_transform = carla.Transform(carla.Location(x=0.8, z=1.8), carla.Rotation(pitch=-10))
-        rgb_cam = world.spawn_actor(rgb_camera_bp, camera_transform, attach_to=ego_vehicle)
-        actors.append(rgb_cam)
-        seg_cam = world.spawn_actor(seg_camera_bp, camera_transform, attach_to=ego_vehicle)
-        actors.append(seg_cam)
-        world.tick()
 
         remaining_pedestrians = counts['pedestrians']
         achieved_occlusion_pct = 0.0
@@ -312,20 +331,16 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
         for _ in range(warmup_ticks):
             world.tick()
 
-        image_queue = queue.Queue()
-        seg_queue = queue.Queue()
-        rgb_cam.listen(image_queue.put)
-        seg_cam.listen(seg_queue.put)
-
-        for _ in range(10):
-            world.tick()
-
+        # cameras have been listening since the chunk started - drop
+        # whatever's queued from before this frame's warmup so we don't
+        # grab a stale image left over from the previous frame
         while not image_queue.empty():
             image_queue.get()
         while not seg_queue.empty():
             seg_queue.get()
 
-        world.tick()
+        for _ in range(10):
+            world.tick()
 
         try:
             rgb_image = image_queue.get(timeout=10.0)
@@ -335,11 +350,6 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
             seg_image = seg_queue.get(timeout=10.0)
         except queue.Empty:
             seg_image = None
-
-        if rgb_cam.is_listening:
-            rgb_cam.stop()
-        if seg_cam.is_listening:
-            seg_cam.stop()
 
         if not rgb_image:
             return False
@@ -487,8 +497,9 @@ def generate_one_frame(client, world, carla_map, blueprints, vehicle_bp, pedestr
 
     finally:
         # runs whether the frame was saved, skipped, or blew up halfway
-        # through - this is what actually prevents actors from piling up
-        destroy_frame_actors(client, actors, ego_vehicle, rgb_cam, seg_cam)
+        # through - this is what actually prevents actors from piling up.
+        # ego_vehicle/rgb_cam/seg_cam are the caller's to manage, not ours.
+        destroy_frame_actors(client, actors)
 
 
 def setup_actor_blueprints(blueprints):
@@ -714,65 +725,99 @@ def main(cli_args=None):
                     except Exception:
                         pass
 
-                chunk_generated = 0
-                attempts = 0
-                # a hard ceiling so one broken chunk (bad map, no valid
-                # spawns, etc) can't spin forever without ever finishing
-                max_total_attempts = chunk_target * 3 + 20
+                # ego vehicle + both cameras are spawned ONCE here and reused
+                # for every frame in this chunk (generate_one_frame just
+                # repositions the ego vehicle each frame) instead of being
+                # respawned per frame - that per-frame respawn of a 4K camera
+                # pair was leaking native-side sensor resources and is what
+                # caused the client to core-dump after ~20-25 images. This is
+                # what actually makes a 1000-2000+ image run survive.
+                ego_vehicle, rgb_cam, seg_cam, image_queue, seg_queue = spawn_ego_and_cameras(
+                    world, vehicle_bp, rgb_camera_bp, seg_camera_bp, crossing_segments[0]['ego_transform']
+                )
+                if not ego_vehicle:
+                    print(f"  could not spawn ego vehicle/cameras on {map_label}, skipping this chunk "
+                          f"({chunk_target} images not generated)")
+                    continue
 
-                print(f"\nscenario '{scenario['name']}' on {map_label}: target {chunk_target} images "
-                      f"({len(plan)} total remaining in plan), resuming at frame {frame_index}")
+                try:
+                    chunk_generated = 0
+                    attempts = 0
+                    # a hard ceiling so one broken chunk (bad map, no valid
+                    # spawns, etc) can't spin forever without ever finishing
+                    max_total_attempts = chunk_target * 3 + 20
 
-                while chunk_generated < chunk_target and plan and attempts < max_total_attempts:
-                    attempts += 1
-                    bucket = plan[0]
+                    print(f"\nscenario '{scenario['name']}' on {map_label}: target {chunk_target} images "
+                          f"({len(plan)} total remaining in plan), resuming at frame {frame_index}")
+
+                    while chunk_generated < chunk_target and plan and attempts < max_total_attempts:
+                        attempts += 1
+                        bucket = plan[0]
+                        try:
+                            saved = generate_one_frame(
+                                client, world, carla_map, blueprints, pedestrian_bps,
+                                walker_controller_bp, ego_vehicle, rgb_cam, seg_cam,
+                                image_queue, seg_queue,
+                                crossing_segments, spawn_points, crosswalk_centers,
+                                scenario, dirs, frame_index, manifest_writer, map_label, bucket
+                            )
+                            manifest_file.flush()
+                            if saved:
+                                consume_plan_item(dirs['base'], plan)
+                                chunk_generated += 1
+                                frame_index += 1
+                                if chunk_generated % 25 == 0:
+                                    print(f"  {chunk_generated}/{chunk_target}")
+
+                            # settle time between frames even on success - spawning
+                            # the next batch of traffic/pedestrians immediately after
+                            # a full destroy, with no breathing room, is a real source
+                            # of spawn-collision failures and engine instability
+                            for _ in range(POST_DESTROY_SETTLE_TICKS):
+                                world.tick()
+                            time.sleep(POST_DESTROY_SETTLE_SECONDS)
+
+                        except Exception as exc:
+                            log_error(log_path, f"scenario={scenario['name']} map={map_label} "
+                                                 f"bucket={bucket} frame_index={frame_index} attempt={attempts}", exc)
+
+                            if looks_like_connection_error(exc):
+                                try:
+                                    # the old ego/cameras belong to the dead
+                                    # connection - don't let cleaning them up
+                                    # throw and mask the real reconnect outcome
+                                    try:
+                                        destroy_ego_and_cameras(rgb_cam, seg_cam, ego_vehicle)
+                                    except Exception:
+                                        pass
+                                    client, world, settings, blueprints, actor_bps = reconnect_with_retries(map_label, log_path)
+                                    vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = actor_bps
+                                    world.set_weather(scenario['weather'])
+                                    carla_map, crossing_segments, crosswalk_centers, spawn_points = scan_map_geometry(world)
+                                    ego_vehicle, rgb_cam, seg_cam, image_queue, seg_queue = spawn_ego_and_cameras(
+                                        world, vehicle_bp, rgb_camera_bp, seg_camera_bp, crossing_segments[0]['ego_transform']
+                                    )
+                                    if not ego_vehicle:
+                                        raise RuntimeError("could not respawn ego vehicle/cameras after reconnecting")
+                                    print("  reconnected, resuming from the same plan/frame position")
+                                except Exception as reconnect_exc:
+                                    log_error(log_path, "gave up trying to reconnect", reconnect_exc)
+                                    print(f"  could not reconnect to CARLA - stopping here. "
+                                          f"Nothing already saved is lost: re-run with "
+                                          f"--resume {output_dir} once the server is back up.")
+                                    raise
+                            else:
+                                print(f"  frame failed, logged to {log_path}, continuing")
+                                time.sleep(0.5)
+
+                    if chunk_generated < chunk_target:
+                        print(f"  only got {chunk_generated}/{chunk_target} for '{scenario['name']}' on {map_label} "
+                              f"after {attempts} attempts, moving on")
+                finally:
                     try:
-                        saved = generate_one_frame(
-                            client, world, carla_map, blueprints, vehicle_bp, pedestrian_bps,
-                            walker_controller_bp, rgb_camera_bp, seg_camera_bp,
-                            crossing_segments, spawn_points, crosswalk_centers,
-                            scenario, dirs, frame_index, manifest_writer, map_label, bucket
-                        )
-                        manifest_file.flush()
-                        if saved:
-                            consume_plan_item(dirs['base'], plan)
-                            chunk_generated += 1
-                            frame_index += 1
-                            if chunk_generated % 25 == 0:
-                                print(f"  {chunk_generated}/{chunk_target}")
-
-                        # settle time between frames even on success - spawning
-                        # the next ego vehicle immediately after a full batch
-                        # destroy, with no breathing room, is a real source of
-                        # spawn-collision failures and engine instability
-                        for _ in range(POST_DESTROY_SETTLE_TICKS):
-                            world.tick()
-                        time.sleep(POST_DESTROY_SETTLE_SECONDS)
-
-                    except Exception as exc:
-                        log_error(log_path, f"scenario={scenario['name']} map={map_label} "
-                                             f"bucket={bucket} frame_index={frame_index} attempt={attempts}", exc)
-
-                        if looks_like_connection_error(exc):
-                            try:
-                                client, world, settings, blueprints, actor_bps = reconnect_with_retries(map_label, log_path)
-                                vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = actor_bps
-                                world.set_weather(scenario['weather'])
-                                carla_map, crossing_segments, crosswalk_centers, spawn_points = scan_map_geometry(world)
-                                print("  reconnected, resuming from the same plan/frame position")
-                            except Exception as reconnect_exc:
-                                log_error(log_path, "gave up trying to reconnect", reconnect_exc)
-                                print(f"  could not reconnect to CARLA - stopping here. "
-                                      f"Nothing already saved is lost: re-run with "
-                                      f"--resume {output_dir} once the server is back up.")
-                                raise
-                        else:
-                            print(f"  frame failed, logged to {log_path}, continuing")
-                            time.sleep(0.5)
-
-                if chunk_generated < chunk_target:
-                    print(f"  only got {chunk_generated}/{chunk_target} for '{scenario['name']}' on {map_label} "
-                          f"after {attempts} attempts, moving on")
+                        destroy_ego_and_cameras(rgb_cam, seg_cam, ego_vehicle)
+                    except Exception:
+                        pass
     finally:
         manifest_file.close()
         # if we got here because reconnecting failed entirely, world/settings
