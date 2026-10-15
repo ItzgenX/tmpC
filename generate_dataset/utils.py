@@ -24,7 +24,7 @@ def get_distance(loc1, loc2):
 
 
 def get_world_corners(box):
-    """Manually calculates the 8 corners of the static bounding box in world space."""
+    # 8 corners of a static bounding box in world space
     box_transform = carla.Transform(box.location, box.rotation)
     ex, ey, ez = box.extent.x, box.extent.y, box.extent.z
    
@@ -45,10 +45,7 @@ def get_world_corners(box):
 
 
 def project_vertices_to_2d(verts, world_to_camera, K, image_w, image_h):
-    """
-    Projects 3D world vertices to 2D image plane, dropping anything behind
-    the camera plane so a bbox can't stretch across the whole frame.
-    """
+    # 3D world vertices to 2D image plane, drops anything behind the camera
     points_2d = []
     valid_depths = []
 
@@ -58,7 +55,7 @@ def project_vertices_to_2d(verts, world_to_camera, K, image_w, image_h):
         p_camera = np.dot(world_to_camera, world_point)
 
 
-        # p_camera[0] is forward depth in CARLA camera space; behind camera, skip
+        # behind the camera, skip
         if p_camera[0] <= 0:
             continue
 
@@ -88,11 +85,7 @@ def is_bbox_valid(x_min, y_min, x_max, y_max,
                   min_area=200,
                   max_area_ratio=0.85,
                   min_dim=10):
-    """
-    Rejects boxes that don't overlap the frame, are too small to be real,
-    cover almost the whole image (usually a bad projection), or have a
-    silly aspect ratio.
-    """
+    # rejects boxes off-frame, too small, too big, or a weird aspect ratio
     if x_max <= 0 or y_max <= 0:
         return False
     if x_min >= image_w or y_min >= image_h:
@@ -179,10 +172,7 @@ def is_visible_and_not_occluded(world, camera, actor_or_loc, max_distance):
 def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
                             min_area=200, check_occlusion=True,
                             min_vertices_in_front=2):
-    """
-    Combines dynamic vehicle actors with static/parked environment vehicles
-    into one bbox list, with the same ghost-box filtering applied to both.
-    """
+    # combines dynamic vehicles with static/parked ones into one bbox list
     K, image_w, image_h = build_camera_intrinsics(camera)
     cam_transform = camera.get_transform()
     world_to_camera = np.array(cam_transform.get_inverse_matrix())
@@ -222,10 +212,7 @@ def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
         )
 
 
-        """
-        need at least a couple vertices in front of the camera or the
-        projection is garbage
-        """
+        # need a few vertices in front of the camera, else projection is garbage
         if len(points_2d) < min_vertices_in_front:
             continue
 
@@ -278,10 +265,7 @@ def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
             continue
 
 
-        """
-        average the corners for the world center instead of trusting
-        obj.transform, which is sometimes (0,0,0) for static map objects
-        """
+        # average corners for world center, obj.transform can be (0,0,0) here
         center_x = sum(v.x for v in verts) / len(verts)
         center_y = sum(v.y for v in verts) / len(verts)
         center_z = sum(v.z for v in verts) / len(verts)
@@ -358,9 +342,7 @@ def get_actor_label(actor):
 
 
 def get_2d_bbox_from_3d(actor, camera):
-    """
-    Given an actor and a camera, returns the 2D bounding box on the camera plane.
-    """
+    # projects an actor's 3D bbox onto the camera plane
     K, image_w, image_h = build_camera_intrinsics(camera)
     cam_transform = camera.get_transform()
     world_to_camera = np.array(cam_transform.get_inverse_matrix())
@@ -406,10 +388,7 @@ def get_2d_bbox_from_3d(actor, camera):
 
 
 def draw_3d_bbox_on_image(img, actor, camera, color=(0, 255, 255), thickness=2):
-    """
-    Draws a 3D bounding box overlay on the provided OpenCV image.
-    Handles resizing logic if the camera resolution differs from the output image.
-    """
+    # draws a 3D bbox overlay, rescaling if img and camera resolution differ
     K, image_w, image_h = build_camera_intrinsics(camera)
     cam_transform = camera.get_transform()
     world_to_camera = np.array(cam_transform.get_inverse_matrix())
@@ -462,9 +441,6 @@ def draw_3d_bbox_on_image(img, actor, camera, color=(0, 255, 255), thickness=2):
 
 
 def draw_2d_bbox_on_image(img, bbox, color=(0, 255, 0), thickness=2):
-    """
-    Draws a 2D bounding box overlay on the provided OpenCV image.
-    """
     if bbox is not None:
         cv2.rectangle(img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, thickness)
 
@@ -472,55 +448,36 @@ def draw_2d_bbox_on_image(img, bbox, color=(0, 255, 0), thickness=2):
 
 
 def save_dataset_sample(img, vehicles_info, camera, output_dir, frame_id):
-    """
-    Saves raw images, 2D labeled images, 3D labeled images, and YOLO 2D labels
-    into separate folders to organize the dataset.
-    """
-    # Define target directories
+    # saves raw/2D/3D images and YOLO labels into separate folders
     raw_dir = os.path.join(output_dir, "raw_images")
     img_2d_dir = os.path.join(output_dir, "images_2d_bbox")
     img_3d_dir = os.path.join(output_dir, "images_3d_bbox")
     labels_2d_dir = os.path.join(output_dir, "labels_2d")
 
-
-    # Create directories if they do not exist
     for folder in [raw_dir, img_2d_dir, img_3d_dir, labels_2d_dir]:
         os.makedirs(folder, exist_ok=True)
-
 
     img_w = img.shape[1]
     img_h = img.shape[0]
     frame_name = f"{frame_id:06d}"
 
-
-    # 1. Save the Raw Image
     raw_img_path = os.path.join(raw_dir, f"{frame_name}.png")
     cv2.imwrite(raw_img_path, img)
 
-
-    # 2. Draw and Save 2D Bounding Box Image & Build YOLO Labels
     img_2d = img.copy()
     yolo_labels = []
     for v in vehicles_info:
-        bbox = v['bbox']  # [x_min, y_min, x_max, y_max]
+        bbox = v['bbox']
         draw_2d_bbox_on_image(img_2d, bbox, color=(0, 255, 0), thickness=2)
-       
-        # Convert to YOLO format
         yolo_box = carla_to_yolo(bbox, img_w, img_h)
-        # Using class ID 0 for 'Vehicle'
         yolo_labels.append(f"0 {yolo_box[0]:.6f} {yolo_box[1]:.6f} {yolo_box[2]:.6f} {yolo_box[3]:.6f}")
-
 
     cv2.imwrite(os.path.join(img_2d_dir, f"{frame_name}.png"), img_2d)
 
-
-    # 3. Save YOLO 2D Labels
     label_path = os.path.join(labels_2d_dir, f"{frame_name}.txt")
     with open(label_path, "w") as f:
         f.write("\n".join(yolo_labels))
 
-
-    # 4. Draw and Save 3D Bounding Box Image
     img_3d = img.copy()
     for v in vehicles_info:
         actor_obj = v['actor_obj']
@@ -573,11 +530,7 @@ def lerp_location(a, b, t):
 
 
 def get_crosswalk_crossing_segments(carla_map, ego_min_dist=5.0, ego_max_dist=12.0):
-    """
-    For each crosswalk polygon, returns the two sidewalk-side endpoints that
-    bound the actual crossing path (not just its center), plus a suggested
-    ego-vehicle approach transform on the road before it.
-    """
+    # per crosswalk: the two crossing endpoints plus an ego approach transform
     segments = []
     current_polygon = []
     for point in carla_map.get_crosswalks():
@@ -632,29 +585,17 @@ def get_crosswalk_crossing_segments(carla_map, ego_min_dist=5.0, ego_max_dist=12
     return segments
 
 
-"""
-Occlusion placement search (project_bbox_for_transform,
-compute_bbox_overlap_fraction, find_best_occlusion_transform,
-place_pedestrian_for_occlusion) moved to occlusion.py - that logic is
-complex enough it deserves its own file and its own set of knobs.
-"""
+# occlusion placement search lives in occlusion.py now
 
 
 def should_use_lights(weather_params):
-    """
-    Reads straight off the weather object instead of matching a name
-    string, so a brand new custom weather still gets sensible headlights
-    without anyone having to register it anywhere.
-    """
+    # reads the weather object directly, works for custom weather too
     return (weather_params.cloudiness > 40 or weather_params.precipitation > 0
             or weather_params.fog_density > 5 or weather_params.sun_altitude_angle < 30)
 
 
 def lane_right_vector(waypoint):
-    """
-    Unit vector pointing to the right of travel, for lateral offsets that
-    stay parallel to the lane instead of drifting the car sideways off it.
-    """
+    # unit vector to the right of travel, for lateral offsets along the lane
     yaw_rad = math.radians(waypoint.transform.rotation.yaw)
     forward_x, forward_y = math.cos(yaw_rad), math.sin(yaw_rad)
     return -forward_y, forward_x
@@ -673,12 +614,7 @@ def jitter_along_lane(waypoint, lateral_jitter=0.0, forward_jitter=0.0):
 
 
 def find_lane_waypoint(carla_map, loc, prefer_bike_lane=False, max_bike_lane_dist=4.0):
-    """
-    Tries a bike lane first, falls back to the driving lane. get_waypoint
-    snaps to the nearest match with no distance cap, so on a map with no
-    real bike lane nearby it could grab one meters away next to a
-    sidewalk - the distance check below rejects that and falls back.
-    """
+    # bike lane first if close enough, else the driving lane
     if prefer_bike_lane:
         bike_wp = carla_map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Biking)
         if bike_wp and bike_wp.transform.location.distance(loc) <= max_bike_lane_dist:
@@ -711,11 +647,7 @@ def is_far_from_all_crosswalks(loc, crosswalk_centers, min_dist):
 
 
 def find_jaywalk_waypoint(carla_map, spawn_points, crosswalk_centers, exclusion_radius, max_attempts=40):
-    """
-    A jaywalk shot is only valid if there's genuinely no crosswalk anywhere
-    near enough to show up in frame - otherwise it just looks like someone
-    ignoring a crossing right next to them, which isn't the point.
-    """
+    # only valid if no crosswalk is near enough to show up in frame
     for _ in range(max_attempts):
         candidate = random.choice(spawn_points)
         if is_far_from_all_crosswalks(candidate.location, crosswalk_centers, exclusion_radius):
@@ -726,11 +658,7 @@ def find_jaywalk_waypoint(carla_map, spawn_points, crosswalk_centers, exclusion_
 
 
 def get_full_road_crossing_segment(waypoint, shoulder_margin=1.5, max_lanes_each_side=6):
-    """
-    Walks outward through adjacent driving lanes to find the true edge of
-    the road on both sides, so a jaywalker crosses the whole street rather
-    than just drifting inside one lane.
-    """
+    # finds the true road edges on both sides, so a jaywalker crosses the whole street
     right_x, right_y = lane_right_vector(waypoint)
     loc = waypoint.transform.location
 
@@ -765,18 +693,7 @@ def get_full_road_crossing_segment(waypoint, shoulder_margin=1.5, max_lanes_each
 
 def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestrian=True,
                             max_rerolls=8, occluded_this_image=False):
-    """
-    Rolls actor counts within a scenario's (min, max) ranges, re-rolling
-    until pedestrians are present and at least min_optional_satisfied of
-    {vehicles, cyclists_scooters, trucks, occluded_this_image} are also
-    true - gives images real variety without letting them go completely
-    empty/boring. If we run out of rerolls we just bump the best attempt
-    up to clear the bar instead of giving up.
-
-    occluded_this_image comes from the exact image-type plan (see
-    image_plan.py), not from anything rolled in here - this function only
-    ever decides pedestrian/vehicle/cyclist/truck counts.
-    """
+    # rolls actor counts, re-rolling until the variety bar is cleared
     def roll(key):
         lo, hi = scenario[key]
         return random.randint(lo, hi)
