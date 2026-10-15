@@ -285,6 +285,22 @@ get every single image maxed out with every category present. Note this
 only governs actor counts now — which crossing type and whether this
 image is occluded come from the exact plan (§5.2), not from a roll here.
 
+**Ambient sidewalk pedestrians** — separate flag, off by default:
+
+```python
+SPAWN_SIDEWALK_PEDESTRIANS = False          # background people on the footpath, not crossing
+SIDEWALK_PEDESTRIAN_COUNT_RANGE = (0, 2)    # rolled fresh per image
+SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MIN = 8.0
+SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MAX = 20.0
+```
+
+These are purely extra background people walking along the sidewalk near
+the ego vehicle — they never enter the road and have nothing to do with
+the crossing/occlusion pedestrian(s) above. Set `SPAWN_SIDEWALK_PEDESTRIANS
+= True` to turn them on; they get labeled `Pedestrian` the same as any
+other walker, no extra config needed for that. Set True and tune the
+count range in `scenario_config.py` for busier-looking street scenes.
+
 ### 5.4 Occlusion
 
 ```python

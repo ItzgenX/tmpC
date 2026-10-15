@@ -28,6 +28,8 @@ from scenario_config import (
     ALLOWED_ESCOOTER_VEHICLES, ALLOWED_TWO_WHEELER_VEHICLES,
     RECONNECT_RETRY_DELAY_SECONDS, RECONNECT_MAX_ATTEMPTS,
     POST_DESTROY_SETTLE_TICKS, POST_DESTROY_SETTLE_SECONDS,
+    SPAWN_SIDEWALK_PEDESTRIANS, SIDEWALK_PEDESTRIAN_COUNT_RANGE,
+    SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MIN, SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MAX,
 )
 from utils import (
     get_2d_bbox_from_3d, is_visible_and_not_occluded, carla_to_yolo,
@@ -36,7 +38,7 @@ from utils import (
     get_crosswalk_centers, find_jaywalk_waypoint, get_full_road_crossing_segment,
     resolve_scenario_counts,
 )
-from spawner import spawn_actor, spawn_pedestrian_crossing, spawn_traffic_vehicles
+from spawner import spawn_actor, spawn_pedestrian_crossing, spawn_traffic_vehicles, spawn_pedestrian_on_sidewalk
 from occlusion import place_pedestrian_for_occlusion
 from image_plan import load_or_build_plan, consume_plan_item
 
@@ -326,6 +328,18 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
                 actors.append(ped)
                 if controller:
                     actors.append(controller)
+
+        # purely background people walking the footpath, never into the
+        # road - separate from (and doesn't affect) the crossing/occlusion
+        # pedestrian(s) above, just makes the street look busier
+        if SPAWN_SIDEWALK_PEDESTRIANS:
+            for _ in range(random.randint(*SIDEWALK_PEDESTRIAN_COUNT_RANGE)):
+                sidewalk_ped, _ = spawn_pedestrian_on_sidewalk(
+                    world, pedestrian_bps, ego_transform,
+                    SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MIN, SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MAX
+                )
+                if sidewalk_ped:
+                    actors.append(sidewalk_ped)
 
         warmup_ticks = random.randint(*CROSSING_WARMUP_TICKS_RANGE)
         for _ in range(warmup_ticks):
