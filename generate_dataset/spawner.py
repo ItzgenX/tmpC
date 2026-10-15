@@ -135,8 +135,10 @@ def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_d
             if not wp:
                 continue
 
-            # jitter along the lane's own right-vector so we stay parallel
-            # to the road instead of clipping sideways off it on a curve
+            """
+            jitter along the lane's own right-vector so we stay parallel
+            to the road instead of clipping sideways off it on a curve
+            """
             candidate_loc = jitter_along_lane(wp, lateral_jitter=random.uniform(-0.4, 0.4))
             candidate_loc.z += 0.5
             if too_close(candidate_loc):
@@ -163,10 +165,12 @@ def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_d
 
 
 def spawn_pedestrian_only(world, pedestrian_bps, crossing_start, crossing_end, progress=None):
-    # just the actor, no walker controller yet - lets a caller (occlusion
-    # search) reposition via set_transform before the controller exists.
-    # teleporting after the controller's attached corrupts CARLA's
-    # crowd-nav state and was the cause of the client core dumps.
+    """
+    Just the actor, no walker controller yet - lets a caller (occlusion
+    search) reposition via set_transform before the controller exists.
+    Teleporting after the controller's attached corrupts CARLA's
+    crowd-nav state and was the cause of the client core dumps.
+    """
     if progress is None:
         progress = random.uniform(0.05, 0.35)
 
@@ -198,8 +202,10 @@ def spawn_pedestrian_only(world, pedestrian_bps, crossing_start, crossing_end, p
 
 def start_walker_controller(world, walker_controller_bp, pedestrian, start_loc, target_loc, yaw,
                              speed_range=(0.9, 1.6)):
-    # pedestrian needs to already be at its final transform - no
-    # set_transform calls on it after this
+    """
+    Pedestrian needs to already be at its final transform - no
+    set_transform calls on it after this.
+    """
     controller = None
     speed = random.uniform(*speed_range)
     try:
@@ -225,10 +231,12 @@ def start_walker_controller(world, walker_controller_bp, pedestrian, start_loc, 
 def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
                                crossing_start, crossing_end,
                                progress=None, speed_range=(0.9, 1.6)):
-    # spawn + start walking immediately - for the normal case where
-    # nothing needs to reposition the pedestrian afterward. works the
-    # same whether the line comes from a crosswalk polygon or a plain
-    # road width (jaywalk case), since it's just two points either way.
+    """
+    Spawn + start walking immediately - for the normal case where
+    nothing needs to reposition the pedestrian afterward. Works the
+    same whether the line comes from a crosswalk polygon or a plain
+    road width (jaywalk case), since it's just two points either way.
+    """
     pedestrian, start_loc, target_loc, yaw = spawn_pedestrian_only(
         world, pedestrian_bps, crossing_start, crossing_end, progress=progress
     )

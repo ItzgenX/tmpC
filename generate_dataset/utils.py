@@ -44,9 +44,11 @@ def get_world_corners(box):
     return world_corners
 
 
-# projects 3D world vertices to 2D image plane, dropping anything behind
-# the camera plane so a bbox can't stretch across the whole frame
 def project_vertices_to_2d(verts, world_to_camera, K, image_w, image_h):
+    """
+    Projects 3D world vertices to 2D image plane, dropping anything behind
+    the camera plane so a bbox can't stretch across the whole frame.
+    """
     points_2d = []
     valid_depths = []
 
@@ -86,9 +88,11 @@ def is_bbox_valid(x_min, y_min, x_max, y_max,
                   min_area=200,
                   max_area_ratio=0.85,
                   min_dim=10):
-    # rejects boxes that don't overlap the frame, are too small to be real,
-    # cover almost the whole image (usually a bad projection), or have a
-    # silly aspect ratio
+    """
+    Rejects boxes that don't overlap the frame, are too small to be real,
+    cover almost the whole image (usually a bad projection), or have a
+    silly aspect ratio.
+    """
     if x_max <= 0 or y_max <= 0:
         return False
     if x_min >= image_w or y_min >= image_h:
@@ -172,11 +176,13 @@ def is_visible_and_not_occluded(world, camera, actor_or_loc, max_distance):
 
 
 
-# combines dynamic vehicle actors with static/parked environment vehicles
-# into one bbox list, with the same ghost-box filtering applied to both
 def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
                             min_area=200, check_occlusion=True,
                             min_vertices_in_front=2):
+    """
+    Combines dynamic vehicle actors with static/parked environment vehicles
+    into one bbox list, with the same ghost-box filtering applied to both.
+    """
     K, image_w, image_h = build_camera_intrinsics(camera)
     cam_transform = camera.get_transform()
     world_to_camera = np.array(cam_transform.get_inverse_matrix())
@@ -216,8 +222,10 @@ def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
         )
 
 
-        # need at least a couple vertices in front of the camera or the
-        # projection is garbage
+        """
+        need at least a couple vertices in front of the camera or the
+        projection is garbage
+        """
         if len(points_2d) < min_vertices_in_front:
             continue
 
@@ -270,8 +278,10 @@ def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
             continue
 
 
-        # average the corners for the world center instead of trusting
-        # obj.transform, which is sometimes (0,0,0) for static map objects
+        """
+        average the corners for the world center instead of trusting
+        obj.transform, which is sometimes (0,0,0) for static map objects
+        """
         center_x = sum(v.x for v in verts) / len(verts)
         center_y = sum(v.y for v in verts) / len(verts)
         center_z = sum(v.z for v in verts) / len(verts)
@@ -622,23 +632,29 @@ def get_crosswalk_crossing_segments(carla_map, ego_min_dist=5.0, ego_max_dist=12
     return segments
 
 
-# occlusion placement search (project_bbox_for_transform,
-# compute_bbox_overlap_fraction, find_best_occlusion_transform,
-# place_pedestrian_for_occlusion) moved to occlusion.py - that logic is
-# complex enough it deserves its own file and its own set of knobs.
+"""
+Occlusion placement search (project_bbox_for_transform,
+compute_bbox_overlap_fraction, find_best_occlusion_transform,
+place_pedestrian_for_occlusion) moved to occlusion.py - that logic is
+complex enough it deserves its own file and its own set of knobs.
+"""
 
 
 def should_use_lights(weather_params):
-    # reads straight off the weather object instead of matching a name
-    # string, so a brand new custom weather still gets sensible headlights
-    # without anyone having to register it anywhere
+    """
+    Reads straight off the weather object instead of matching a name
+    string, so a brand new custom weather still gets sensible headlights
+    without anyone having to register it anywhere.
+    """
     return (weather_params.cloudiness > 40 or weather_params.precipitation > 0
             or weather_params.fog_density > 5 or weather_params.sun_altitude_angle < 30)
 
 
 def lane_right_vector(waypoint):
-    # unit vector pointing to the right of travel, for lateral offsets that
-    # stay parallel to the lane instead of drifting the car sideways off it
+    """
+    Unit vector pointing to the right of travel, for lateral offsets that
+    stay parallel to the lane instead of drifting the car sideways off it.
+    """
     yaw_rad = math.radians(waypoint.transform.rotation.yaw)
     forward_x, forward_y = math.cos(yaw_rad), math.sin(yaw_rad)
     return -forward_y, forward_x
@@ -657,10 +673,12 @@ def jitter_along_lane(waypoint, lateral_jitter=0.0, forward_jitter=0.0):
 
 
 def find_lane_waypoint(carla_map, loc, prefer_bike_lane=False, max_bike_lane_dist=4.0):
-    # tries a bike lane first, falls back to the driving lane. get_waypoint
-    # snaps to the nearest match with no distance cap, so on a map with no
-    # real bike lane nearby it could grab one meters away next to a
-    # sidewalk - the distance check below rejects that and falls back
+    """
+    Tries a bike lane first, falls back to the driving lane. get_waypoint
+    snaps to the nearest match with no distance cap, so on a map with no
+    real bike lane nearby it could grab one meters away next to a
+    sidewalk - the distance check below rejects that and falls back.
+    """
     if prefer_bike_lane:
         bike_wp = carla_map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Biking)
         if bike_wp and bike_wp.transform.location.distance(loc) <= max_bike_lane_dist:
@@ -693,9 +711,11 @@ def is_far_from_all_crosswalks(loc, crosswalk_centers, min_dist):
 
 
 def find_jaywalk_waypoint(carla_map, spawn_points, crosswalk_centers, exclusion_radius, max_attempts=40):
-    # a jaywalk shot is only valid if there's genuinely no crosswalk anywhere
-    # near enough to show up in frame - otherwise it just looks like someone
-    # ignoring a crossing right next to them, which isn't the point
+    """
+    A jaywalk shot is only valid if there's genuinely no crosswalk anywhere
+    near enough to show up in frame - otherwise it just looks like someone
+    ignoring a crossing right next to them, which isn't the point.
+    """
     for _ in range(max_attempts):
         candidate = random.choice(spawn_points)
         if is_far_from_all_crosswalks(candidate.location, crosswalk_centers, exclusion_radius):
@@ -706,9 +726,11 @@ def find_jaywalk_waypoint(carla_map, spawn_points, crosswalk_centers, exclusion_
 
 
 def get_full_road_crossing_segment(waypoint, shoulder_margin=1.5, max_lanes_each_side=6):
-    # walks outward through adjacent driving lanes to find the true edge of
-    # the road on both sides, so a jaywalker crosses the whole street rather
-    # than just drifting inside one lane
+    """
+    Walks outward through adjacent driving lanes to find the true edge of
+    the road on both sides, so a jaywalker crosses the whole street rather
+    than just drifting inside one lane.
+    """
     right_x, right_y = lane_right_vector(waypoint)
     loc = waypoint.transform.location
 
