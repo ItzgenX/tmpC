@@ -135,6 +135,16 @@ REQUIRE_PEDESTRIAN = True
 MIN_OPTIONAL_CATEGORIES_SATISFIED = 2
 MAX_COUNT_REROLLS = 8
 
+# --- ambient sidewalk pedestrians (separate from the crossing pedestrian(s)
+# above - these just walk along the footpath, never into the road) ---
+# off by default; set True to add background pedestrians on the sidewalk
+# for busier-looking street scenes. Doesn't affect the crossing/occlusion
+# pedestrian(s) at all - this is purely extra background people.
+SPAWN_SIDEWALK_PEDESTRIANS = False
+SIDEWALK_PEDESTRIAN_COUNT_RANGE = (0, 2)   # rolled fresh per image
+SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MIN = 8.0
+SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MAX = 20.0
+
 
 # --- occlusion search tuning (see occlusion.py for the actual logic) ---
 # how many points along the crossing line to test for a placement
