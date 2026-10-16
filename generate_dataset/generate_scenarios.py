@@ -28,7 +28,7 @@ from scenario_config import (
     ALLOWED_CAR_VEHICLES, ALLOWED_TRUCK_VEHICLES, ALLOWED_CYCLIST_SCOOTER_VEHICLES,
     ALLOWED_ESCOOTER_VEHICLES, ALLOWED_TWO_WHEELER_VEHICLES,
     RECONNECT_RETRY_DELAY_SECONDS, RECONNECT_MAX_ATTEMPTS,
-    POST_DESTROY_SETTLE_TICKS, POST_DESTROY_SETTLE_SECONDS,
+    POST_DESTROY_SETTLE_TICKS, POST_DESTROY_SETTLE_SECONDS, EGO_REFRESH_EVERY_N_IMAGES,
     SPAWN_SIDEWALK_PEDESTRIANS, SIDEWALK_PEDESTRIAN_COUNT_RANGE,
     SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MIN, SIDEWALK_PEDESTRIAN_SPAWN_DISTANCE_MAX,
 )
@@ -138,26 +138,16 @@ def log_error(log_path, context, exc):
         f.write(traceback.format_exc())
 
 
-def destroy_frame_actors(client, world, actors):
-    """
-    Ego vehicle and cameras live outside this now, reused per chunk.
-    Walker controllers are stopped and destroyed in their own batch,
-    separately from (and before) everything else, with a tick on each
-    side - a single shared tick wasn't enough margin for CARLA's crowd-nav
-    manager to let go of an actively-navigating pedestrian before it got
-    destroyed, which is an uncatchable native crash, not a Python one.
-    """
-    controllers = [a for a in actors if a and a.is_alive and hasattr(a, 'type_id') and a.type_id.startswith('controller.')]
-    others = [a for a in actors if a and a.is_alive and a not in controllers]
+def destroy_frame_actors(client, actors):
+    # ego vehicle and cameras live outside this now, reused per chunk.
+    # stop controllers, then destroy everything in one batch - no settle
+    # tick in between, matching CARLA's own reference examples. an earlier
+    # version of this inserted ticks here on a theory that didn't hold up.
+    for actor in actors:
+        if actor and actor.is_alive and hasattr(actor, 'type_id') and actor.type_id.startswith('controller.'):
+            actor.stop()
 
-    if controllers:
-        for c in controllers:
-            c.stop()
-        world.tick()
-        client.apply_batch([carla.command.DestroyActor(c) for c in controllers if c.is_alive])
-        world.tick()
-
-    commands = [carla.command.DestroyActor(a) for a in others if a.is_alive]
+    commands = [carla.command.DestroyActor(actor) for actor in actors if actor and actor.is_alive]
     if commands:
         client.apply_batch(commands)
 
@@ -512,7 +502,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
 
     finally:
         # always runs, keeps actors from piling up
-        destroy_frame_actors(client, world, actors)
+        destroy_frame_actors(client, actors)
 
 
 def setup_actor_blueprints(blueprints):
@@ -767,6 +757,21 @@ def main(cli_args=None):
                             for _ in range(POST_DESTROY_SETTLE_TICKS):
                                 world.tick()
                             time.sleep(POST_DESTROY_SETTLE_SECONDS)
+
+                            # caps how long one ego/camera set stays alive,
+                            # rather than reusing it for an entire chunk.
+                            # spawn the replacement BEFORE destroying the
+                            # current one, so a failed respawn just skips
+                            # this round instead of leaving no valid ego
+                            if saved and chunk_generated % EGO_REFRESH_EVERY_N_IMAGES == 0:
+                                new_ego, new_rgb_cam, new_seg_cam = spawn_ego_and_cameras(
+                                    world, vehicle_bp, rgb_camera_bp, seg_camera_bp,
+                                    random.choice(crossing_segments)['ego_transform']
+                                )
+                                if new_ego:
+                                    old_ego, old_rgb_cam, old_seg_cam = ego_vehicle, rgb_cam, seg_cam
+                                    ego_vehicle, rgb_cam, seg_cam = new_ego, new_rgb_cam, new_seg_cam
+                                    destroy_ego_and_cameras(old_rgb_cam, old_seg_cam, old_ego)
 
                         except Exception as exc:
                             log_error(log_path, f"scenario={scenario['name']} map={map_label} "
