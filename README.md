@@ -158,7 +158,7 @@ For every frame, `generate_scenarios.py` does roughly this:
    controllers), then give the simulation a short settle period
    (`POST_DESTROY_SETTLE_TICKS`/`_SECONDS`) before the next frame starts
    spawning — see §8 for why this matters.
-10. **Pop the consumed item off the plan and persist what's left to
+10. **Decrement that bucket's remaining count and persist it to
     `plan.json`**, log one row to `manifest.csv`.
 
 ---
@@ -176,7 +176,7 @@ dataset_scenarios/
     run_log.txt
     summary.txt
     clear/
-      plan.json              remaining (unconsumed) image-type queue
+      plan.json              remaining count per image-type bucket
       images/                frame_000000.png ...
       labels/                frame_000000.txt   (YOLO format)
       labels_3d/             frame_000000.json  (richer per-detection data)
@@ -503,9 +503,14 @@ things now address this:
 
 1. **Every image's progress is persisted immediately, not batched.**
    Frame numbering comes from what's actually in `images/` on disk, and
-   each scenario's remaining image-type queue is written to `plan.json`
-   the instant an image is saved (`image_plan.consume_plan_item`) — never
-   held only in memory. A crash loses at most the one frame in flight.
+   each scenario's remaining count per bucket (e.g. `{"crosswalk_clear":
+   25, "crosswalk_occluded": 25, ...}`, not one entry per image) is
+   written to `plan.json` the instant an image is saved
+   (`image_plan.consume_plan_item`) — never held only in memory. The next
+   bucket to attempt is picked by weighting on these remaining counts,
+   which reproduces the same spread-evenly-across-the-run behavior as a
+   shuffled per-image list would, just without writing one line per
+   image. A crash loses at most the one frame in flight.
 2. **A dead connection triggers an active reconnect loop, not a dead
    retry.** If an exception looks like a connection failure (timeout,
    broken pipe, etc.), the script waits `RECONNECT_RETRY_DELAY_SECONDS`

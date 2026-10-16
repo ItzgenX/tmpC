@@ -41,7 +41,7 @@ from utils import (
 )
 from spawner import spawn_actor, spawn_pedestrian_crossing, spawn_traffic_vehicles, spawn_pedestrian_on_sidewalk
 from occlusion import place_pedestrian_for_occlusion
-from image_plan import load_or_build_plan, consume_plan_item
+from image_plan import load_or_build_plan, consume_plan_item, pick_next_bucket, total_remaining
 
 
 # shortcuts for the three "one type only" batches
@@ -698,14 +698,14 @@ def main(cli_args=None):
                 scenario.get('allow_jaywalk', False), scenario.get('allow_occlusion', False)
             )
 
-            if not plan:
+            if total_remaining(plan) == 0:
                 print(f"\nscenario '{scenario['name']}': plan already complete, skipping")
                 continue
 
-            map_chunks = resolve_map_chunks(len(plan))
+            map_chunks = resolve_map_chunks(total_remaining(plan))
 
             for map_name, chunk_target in map_chunks:
-                if chunk_target <= 0 or not plan:
+                if chunk_target <= 0 or total_remaining(plan) == 0:
                     continue
 
                 if map_name and world.get_map().name.split('/')[-1] != map_name:
@@ -747,11 +747,11 @@ def main(cli_args=None):
                     max_total_attempts = chunk_target * 3 + 20
 
                     print(f"\nscenario '{scenario['name']}' on {map_label}: target {chunk_target} images "
-                          f"({len(plan)} total remaining in plan), resuming at frame {frame_index}")
+                          f"({total_remaining(plan)} total remaining in plan), resuming at frame {frame_index}")
 
-                    while chunk_generated < chunk_target and plan and attempts < max_total_attempts:
+                    while chunk_generated < chunk_target and total_remaining(plan) > 0 and attempts < max_total_attempts:
                         attempts += 1
-                        bucket = plan[0]
+                        bucket = pick_next_bucket(plan)
                         try:
                             saved = generate_one_frame(
                                 client, world, carla_map, blueprints, pedestrian_bps,
@@ -761,7 +761,7 @@ def main(cli_args=None):
                             )
                             manifest_file.flush()
                             if saved:
-                                consume_plan_item(dirs['base'], plan)
+                                consume_plan_item(dirs['base'], plan, bucket)
                                 chunk_generated += 1
                                 frame_index += 1
                                 if chunk_generated % 25 == 0:

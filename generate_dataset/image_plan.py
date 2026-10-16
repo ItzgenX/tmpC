@@ -23,8 +23,8 @@ def allocate_counts(n, split_pct):
     return floors
 
 
-def build_image_plan(n, split_pct, allow_jaywalk, allow_occlusion):
-    # shuffled list of n bucket labels, disallowed buckets fold into allowed ones
+def build_remaining_counts(n, split_pct, allow_jaywalk, allow_occlusion):
+    # remaining count per bucket, disallowed buckets fold into allowed ones
     counts = allocate_counts(n, split_pct)
     merged = {b: 0 for b in BUCKETS}
 
@@ -36,11 +36,7 @@ def build_image_plan(n, split_pct, allow_jaywalk, allow_occlusion):
             occlusion = "clear"
         merged[f"{crossing}_{occlusion}"] += count
 
-    plan = []
-    for bucket, count in merged.items():
-        plan.extend([bucket] * count)
-    random.shuffle(plan)
-    return plan
+    return merged
 
 
 def plan_path(scenario_dir):
@@ -48,23 +44,36 @@ def plan_path(scenario_dir):
 
 
 def load_or_build_plan(scenario_dir, n, split_pct, allow_jaywalk, allow_occlusion):
-    # resumes from disk if present; an empty file means already finished
+    # resumes from disk if present; all-zero counts means already finished
     path = plan_path(scenario_dir)
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
 
-    plan = build_image_plan(n, split_pct, allow_jaywalk, allow_occlusion)
-    save_plan(scenario_dir, plan)
-    return plan
+    remaining = build_remaining_counts(n, split_pct, allow_jaywalk, allow_occlusion)
+    save_plan(scenario_dir, remaining)
+    return remaining
 
 
-def save_plan(scenario_dir, remaining_plan):
+def save_plan(scenario_dir, remaining):
     with open(plan_path(scenario_dir), 'w') as f:
-        json.dump(remaining_plan, f)
+        json.dump(remaining, f, indent=2)
 
 
-def consume_plan_item(scenario_dir, remaining_plan):
-    # pops + persists, so a crash only loses the image in flight
-    remaining_plan.pop(0)
-    save_plan(scenario_dir, remaining_plan)
+def total_remaining(remaining):
+    return sum(remaining.values())
+
+
+def pick_next_bucket(remaining):
+    # weighted by remaining count - same distribution as popping from the
+    # front of a shuffled list of repeated bucket names, without storing
+    # one entry per image
+    buckets = [b for b, c in remaining.items() if c > 0]
+    weights = [remaining[b] for b in buckets]
+    return random.choices(buckets, weights=weights)[0]
+
+
+def consume_plan_item(scenario_dir, remaining, bucket):
+    # decrements + persists, so a crash only loses the image in flight
+    remaining[bucket] -= 1
+    save_plan(scenario_dir, remaining)
