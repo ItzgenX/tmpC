@@ -9,15 +9,17 @@ relaunching with --resume latest until the whole plan is actually done.
 Usage (same args as a normal run, used only for the very first launch):
     .\run_until_done.ps1
     .\run_until_done.ps1 -Mode occlusion_only -Count 100
+    .\run_until_done.ps1 -Weather clear -Count 50
 
 After the first launch, every relaunch uses --resume latest automatically -
-Mode/Count are ignored on restarts since --resume continues the existing
-plan, which already has the split baked in.
+Mode/Count/Weather are ignored on restarts since --resume continues the
+existing plan, which already has the split and scenario baked in.
 #>
 
 param(
     [string]$Mode = "",
     [string]$Count = "",
+    [string]$Weather = "",
     [int]$MaxAttempts = 100,
     [int]$CooldownSeconds = 5,
     [int]$FastCrashSeconds = 8,
@@ -30,6 +32,7 @@ Set-Location $scriptDir
 $firstRunArgs = @()
 if ($Mode -ne "") { $firstRunArgs += @("--mode", $Mode) }
 if ($Count -ne "") { $firstRunArgs += @("--count", $Count) }
+if ($Weather -ne "") { $firstRunArgs += @("--weather", $Weather) }
 
 $attempt = 0
 $consecutiveFastCrashes = 0

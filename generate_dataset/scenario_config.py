@@ -211,7 +211,7 @@ ALLOWED_CYCLIST_SCOOTER_VEHICLES = (
 
 
 # --- output folder naming ---
-def resolve_output_dir(split_pct=None, mode_name=None):
+def resolve_output_dir(split_pct=None, mode_name=None, weather_name=None):
     """Builds this run's output folder name from the active split + timestamp."""
     split_pct = split_pct or IMAGE_TYPE_SPLIT
     active = sorted((k, v) for k, v in split_pct.items() if v > 0)
@@ -226,6 +226,9 @@ def resolve_output_dir(split_pct=None, mode_name=None):
         split_tag = "default_split"
     else:
         split_tag = "custom_split"
+
+    if weather_name:
+        split_tag = f"{split_tag}__{weather_name}"
 
     if MAP_ROTATION:
         map_tag = "map_rotation"

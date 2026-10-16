@@ -70,11 +70,27 @@ def parse_args():
         help="override number_images_to_generate for every scenario (per scenario, not total)."
     )
     parser.add_argument(
+        "--weather", type=str, default=None,
+        help="restrict this run to one SCENARIOS entry by name (e.g. 'clear'), instead of "
+             "cycling through every weather condition. Combine with --count for an exact "
+             "total, e.g. --weather clear --count 50 makes exactly 50 images, all clear weather."
+    )
+    parser.add_argument(
         "--resume", type=str, default=None,
         help="path to a previous run folder, or 'latest' for the most recent one. "
              "Resumes exactly where that run left off."
     )
     return parser.parse_args()
+
+
+def resolve_scenarios(weather_name):
+    if not weather_name:
+        return SCENARIOS
+    matches = [s for s in SCENARIOS if s['name'] == weather_name]
+    if not matches:
+        names = ", ".join(s['name'] for s in SCENARIOS)
+        raise ValueError(f"no scenario named '{weather_name}' in SCENARIOS - available: {names}")
+    return matches
 
 
 def resolve_split(mode):
@@ -658,8 +674,13 @@ def main(cli_args=None):
         cli_args = parse_args()
 
     active_split = resolve_split(cli_args.mode)
+    try:
+        active_scenarios = resolve_scenarios(cli_args.weather)
+    except ValueError as exc:
+        print(f"  {exc}")
+        return
     if cli_args.count is not None:
-        for scenario in SCENARIOS:
+        for scenario in active_scenarios:
             scenario['number_images_to_generate'] = cli_args.count
 
     if cli_args.resume == "latest":
@@ -669,7 +690,7 @@ def main(cli_args=None):
             return
         print(f"resuming latest run: {output_dir}")
     else:
-        output_dir = cli_args.resume or resolve_output_dir(active_split, cli_args.mode)
+        output_dir = cli_args.resume or resolve_output_dir(active_split, cli_args.mode, cli_args.weather)
     os.makedirs(output_dir, exist_ok=True)
 
     client, world, settings, blueprints, actor_bps = connect_to_server(MAP_NAME if not MAP_ROTATION else None)
@@ -690,7 +711,7 @@ def main(cli_args=None):
     log_path = os.path.join(output_dir, "run_log.txt")
 
     try:
-        for scenario in SCENARIOS:
+        for scenario in active_scenarios:
             dirs = scenario_dirs(output_dir, scenario['name'])
             frame_index = next_frame_index(dirs['images'])
             plan = load_or_build_plan(
