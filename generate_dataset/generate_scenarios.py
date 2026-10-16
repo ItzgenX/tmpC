@@ -24,6 +24,7 @@ from scenario_config import (
     TRUCK_SPAWN_DISTANCE_MIN, TRUCK_SPAWN_DISTANCE_MAX, TRUCK_SPAWN_LATERAL_RANGE,
     CYCLIST_SCOOTER_SPAWN_DISTANCE_MIN, CYCLIST_SCOOTER_SPAWN_DISTANCE_MAX, CYCLIST_SCOOTER_SPAWN_LATERAL_RANGE,
     MIN_SEPARATION_BETWEEN_VEHICLES, MIN_SEPARATION_TRUCK_TO_CYCLIST, MAX_SPAWN_ATTEMPTS_PER_ACTOR,
+    CROSSWALK_VEHICLE_EXCLUSION_RADIUS,
     ALLOWED_CAR_VEHICLES, ALLOWED_TRUCK_VEHICLES, ALLOWED_CYCLIST_SCOOTER_VEHICLES,
     ALLOWED_ESCOOTER_VEHICLES, ALLOWED_TWO_WHEELER_VEHICLES,
     RECONNECT_RETRY_DELAY_SECONDS, RECONNECT_MAX_ATTEMPTS,
@@ -137,11 +138,17 @@ def log_error(log_path, context, exc):
         f.write(traceback.format_exc())
 
 
-def destroy_frame_actors(client, actors):
+def destroy_frame_actors(client, world, actors):
     # ego vehicle and cameras live outside this now, reused per chunk
-    for actor in actors:
-        if actor and actor.is_alive and hasattr(actor, 'type_id') and actor.type_id.startswith('controller.'):
-            actor.stop()
+    controllers = [a for a in actors if a and a.is_alive and hasattr(a, 'type_id') and a.type_id.startswith('controller.')]
+    for actor in controllers:
+        actor.stop()
+
+    if controllers:
+        # lets the crowd-nav manager process the stop before the walker's
+        # destroyed out from under it - skipping this risked an uncatchable
+        # native crash on an actively-navigating pedestrian
+        world.tick()
 
     commands = [carla.command.DestroyActor(actor) for actor in actors if actor and actor.is_alive]
     if commands:
@@ -229,11 +236,15 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
                                           occluded_this_image=wants_occlusion)
         target_occlusion_percent = random.randint(*OCCLUSION_PERCENT_RANGE) if wants_occlusion else 0
 
+        # keeps traffic off the marked crosswalk stripe itself, not the full jaywalk road width
+        avoid_segment = (crossing_start, crossing_end) if not is_jaywalk else None
+
         vehicles_list = spawn_traffic_vehicles(
             world, blueprints, ego_transform, counts['vehicles'],
             TRAFFIC_VEHICLE_SPAWN_DISTANCE_MIN, TRAFFIC_VEHICLE_SPAWN_DISTANCE_MAX,
             TRAFFIC_VEHICLE_SPAWN_LATERAL_RANGE, lights_on, ALLOWED_CAR_VEHICLES,
-            min_spacing=MIN_SEPARATION_BETWEEN_VEHICLES, max_attempts=MAX_SPAWN_ATTEMPTS_PER_ACTOR
+            min_spacing=MIN_SEPARATION_BETWEEN_VEHICLES, max_attempts=MAX_SPAWN_ATTEMPTS_PER_ACTOR,
+            avoid_segment=avoid_segment, avoid_segment_dist=CROSSWALK_VEHICLE_EXCLUSION_RADIUS
         )
         actors.extend(vehicles_list)
 
@@ -241,7 +252,8 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
             world, blueprints, ego_transform, counts['trucks'],
             TRUCK_SPAWN_DISTANCE_MIN, TRUCK_SPAWN_DISTANCE_MAX,
             TRUCK_SPAWN_LATERAL_RANGE, lights_on, ALLOWED_TRUCK_VEHICLES,
-            min_spacing=MIN_SEPARATION_BETWEEN_VEHICLES, max_attempts=MAX_SPAWN_ATTEMPTS_PER_ACTOR
+            min_spacing=MIN_SEPARATION_BETWEEN_VEHICLES, max_attempts=MAX_SPAWN_ATTEMPTS_PER_ACTOR,
+            avoid_segment=avoid_segment, avoid_segment_dist=CROSSWALK_VEHICLE_EXCLUSION_RADIUS
         )
         actors.extend(trucks_list)
 
@@ -252,7 +264,8 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
             CYCLIST_SCOOTER_SPAWN_LATERAL_RANGE, lights_on, ALLOWED_CYCLIST_SCOOTER_VEHICLES,
             prefer_bike_lane=True, keep_away_from=trucks_list,
             keep_away_dist=MIN_SEPARATION_TRUCK_TO_CYCLIST,
-            min_spacing=MIN_SEPARATION_BETWEEN_VEHICLES, max_attempts=MAX_SPAWN_ATTEMPTS_PER_ACTOR
+            min_spacing=MIN_SEPARATION_BETWEEN_VEHICLES, max_attempts=MAX_SPAWN_ATTEMPTS_PER_ACTOR,
+            avoid_segment=avoid_segment, avoid_segment_dist=CROSSWALK_VEHICLE_EXCLUSION_RADIUS
         )
         actors.extend(cyclists_list)
 
@@ -480,7 +493,7 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
 
     finally:
         # always runs, keeps actors from piling up
-        destroy_frame_actors(client, actors)
+        destroy_frame_actors(client, world, actors)
 
 
 def setup_actor_blueprints(blueprints):

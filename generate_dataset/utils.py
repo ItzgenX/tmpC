@@ -23,6 +23,19 @@ def get_distance(loc1, loc2):
     )
 
 
+def distance_to_segment(loc, seg_start, seg_end):
+    # 2D distance from a point to a line segment
+    ax, ay = seg_start.x, seg_start.y
+    bx, by = seg_end.x, seg_end.y
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0:
+        return get_distance(loc, seg_start)
+    t = max(0.0, min(1.0, ((loc.x - ax) * dx + (loc.y - ay) * dy) / length_sq))
+    closest = carla.Location(x=ax + t * dx, y=ay + t * dy, z=loc.z)
+    return get_distance(loc, closest)
+
+
 def get_world_corners(box):
     # 8 corners of a static bounding box in world space
     box_transform = carla.Transform(box.location, box.rotation)
