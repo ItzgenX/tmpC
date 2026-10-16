@@ -68,7 +68,7 @@ That's it for a default run. It will:
    generated: how many were crosswalk vs. jaywalk, how many were occluded
    vs. clear, per scenario.
 
-Three CLI flags cover the common cases without editing anything:
+CLI flags cover the common cases without editing anything:
 
 ```bash
 python generate_scenarios.py --mode jaywalk_only --count 50
@@ -76,19 +76,27 @@ python generate_scenarios.py --mode crosswalk_only --count 50
 python generate_scenarios.py --mode occlusion_only --count 50
 python generate_scenarios.py --mode mixed   # or just omit --mode entirely
 
+# restrict to one weather condition instead of cycling through all of them -
+# --count here means a real total, since only one scenario is running
+python generate_scenarios.py --weather clear --count 50
+
 # continue a previous run (e.g. after a CARLA crash) instead of starting fresh:
 python generate_scenarios.py --resume dataset_scenarios/default_split__current_map__20261014_120000
 ```
 
 `--mode` restricts the image-type split for this run only (doesn't touch
 `scenario_config.py`); `--count` overrides `number_images_to_generate` on
-every scenario in `SCENARIOS` (so `--count 50` means 50 images for *each*
-scenario, not 50 total — see §8); `--resume` points at an existing run
-folder to continue exactly where it left off, or `--resume latest` to
-auto-pick the most recently modified one. Weather still cycles
-through the full `SCENARIOS` table regardless of `--mode`, so an
-`occlusion_only` or `jaywalk_only` batch still covers every configured
-weather condition, not just one.
+every *active* scenario (so `--count 50` means 50 images for each scenario
+still in play — with no `--weather`, that's every entry in `SCENARIOS`,
+so not 50 total; see §8); `--weather <name>` restricts the run to a single
+named entry from `SCENARIOS` (e.g. `clear`, `overcast`) instead of cycling
+through all of them, so combined with `--count` it does give an exact
+total; `--resume` points at an existing run folder to continue exactly
+where it left off, or `--resume latest` to auto-pick the most recently
+modified one. Without `--weather`, weather still cycles through the full
+`SCENARIOS` table regardless of `--mode`, so an `occlusion_only` or
+`jaywalk_only` batch still covers every configured weather condition, not
+just one.
 
 ### 2.1 Running it reliably through crashes: `run_until_done.ps1`
 
@@ -106,13 +114,14 @@ full plan actually finishes.
 cd generate_dataset
 .\run_until_done.ps1                              # default mixed run
 .\run_until_done.ps1 -Mode occlusion_only -Count 100
+.\run_until_done.ps1 -Weather clear -Count 50
 ```
 
-`-Mode`/`-Count` only matter for the very first launch — every relaunch
-after that uses `--resume latest`, since the plan (and the split that
-was baked into it) already lives on disk. If it crashes 5 times in a
-row in under 8 seconds each, it stops and tells you to restart the
-CARLA server by hand instead of burning through retries — that pattern
+`-Mode`/`-Count`/`-Weather` only matter for the very first launch — every
+relaunch after that uses `--resume latest`, since the plan (and the split
+and scenario that were baked into it) already lives on disk. If it
+crashes 5 times in a row in under 8 seconds each, it stops and tells you
+to restart the CARLA server by hand instead of burning through retries — that pattern
 means the server itself is the problem, not a one-off client crash.
 
 ---
@@ -452,6 +461,13 @@ Each writes to its own timestamped folder, so these three never collide.
 `--count 50` applies to *every* scenario in `SCENARIOS`, so each command
 above actually produces 50 × (number of active scenarios) images, not 50
 total — see §9.
+
+**Exactly 50 images, all one weather condition, 50% occluded / 50% clear:**
+```bash
+python generate_scenarios.py --weather clear --count 50
+```
+`--weather` restricts to that one `SCENARIOS` entry, so `--count` here
+really is the total — no multiplying by other weather conditions.
 
 **Resume a run that got interrupted (CARLA crash, you stopped it, etc.):**
 ```bash
