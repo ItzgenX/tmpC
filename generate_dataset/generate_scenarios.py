@@ -505,6 +505,19 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
         destroy_frame_actors(client, actors)
 
 
+def cleanup_stale_ego_actors(client, world, vehicle_bp):
+    # a previous run that aborted (uncaught native crash) never tears
+    # down its actors - the server keeps them. destroys any leftover
+    # actor matching our ego vehicle blueprint before this run spawns
+    # its own, so a fresh run doesn't fail to spawn (or touch a dangling
+    # actor) because of a leftover ego from a crashed previous process
+    stale = [a for a in world.get_actors() if a.type_id == vehicle_bp.id]
+    if stale:
+        print(f"  found {len(stale)} leftover ego vehicle(s) from a previous run, cleaning up")
+        client.apply_batch([carla.command.DestroyActor(a) for a in stale])
+        world.tick()
+
+
 def setup_actor_blueprints(blueprints):
     vehicle_bp = blueprints.filter('my_car_xyz')[0]
     pedestrian_bps = blueprints.filter('walker.pedestrian.*')
@@ -661,6 +674,7 @@ def main(cli_args=None):
 
     client, world, settings, blueprints, actor_bps = connect_to_server(MAP_NAME if not MAP_ROTATION else None)
     vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = actor_bps
+    cleanup_stale_ego_actors(client, world, vehicle_bp)
 
     manifest_path = os.path.join(output_dir, "manifest.csv")
     manifest_is_new = not os.path.exists(manifest_path)
@@ -786,6 +800,7 @@ def main(cli_args=None):
                                         pass
                                     client, world, settings, blueprints, actor_bps = reconnect_with_retries(map_label, log_path)
                                     vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = actor_bps
+                                    cleanup_stale_ego_actors(client, world, vehicle_bp)
                                     world.set_weather(scenario['weather'])
                                     carla_map, crossing_segments, crosswalk_centers, spawn_points = scan_map_geometry(world)
                                     ego_vehicle, rgb_cam, seg_cam = spawn_ego_and_cameras(
