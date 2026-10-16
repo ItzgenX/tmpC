@@ -511,11 +511,10 @@ things now address this:
    into `spawn_pedestrian_only` (just the actor, no controller) and
    `start_walker_controller` (attaches + starts it), and the occlusion
    path always repositions the pedestrian via `spawn_pedestrian_only` +
-   `set_transform` *before* the controller is ever attached. If you were
-   hitting this specific symptom, it should be resolved; if a script-side
-   core dump still happens, it's worth checking whether it only ever
-   occurs on `*_occluded` images specifically (which would point at
-   something else occlusion-related) versus any image type.
+   `set_transform` *before* the controller is ever attached. (Superseded
+   by point 7 below: the AI controller this ordering was protecting
+   against has since been removed entirely, which closes off this whole
+   class of crash rather than just one ordering within it.)
 
 5. **Ego vehicle and both cameras are no longer respawned every frame.**
    The RGB and semantic segmentation cameras run at 4K (3840x2160).
@@ -545,17 +544,32 @@ things now address this:
    `stop()` right after, the same tightly-scoped pattern the original
    per-frame-respawn code used — just without respawning the actors
    themselves.
-7. **A tick between stopping a walker controller and destroying it.**
-   `destroy_frame_actors` calls `stop()` on every walker AI controller
-   before batch-destroying it and its pedestrian, but was destroying them
-   in the very same instant `stop()` was issued, with no `world.tick()`
-   in between for CARLA's crowd-nav manager to actually process that
-   stop. Yanking an actor out from under a controller the crowd manager
-   still considers "active" is exactly the same class of uncatchable
-   native crash as point 6 above, just intermittent rather than a fixed
-   threshold - it could surface anywhere, not consistently at the same
-   frame count. One `world.tick()` is now inserted after stopping
-   controllers and before the destroy batch runs.
+7. **Pedestrians no longer use an AI walker controller at all.** Every
+   version of the original reference script drives a pedestrian with a
+   manual `carla.WalkerControl()` (direction + speed) applied directly,
+   never a `controller.ai.walker` actor - that blueprint gets looked up
+   but is never actually spawned anywhere in the reference code. An
+   earlier version of this project added the AI controller for a more
+   natural walk cycle, but that ties the pedestrian into CARLA's
+   crowd-nav manager, and destroying an actor the manager still
+   considers "active" is an uncatchable native crash (`terminate called
+   after throwing an instance of 'std::runtime_error' ... trying to
+   operate on destroyed actor ... Aborted (core dumped)`). Two attempts
+   to fix this by inserting settle ticks between stopping and destroying
+   a controller didn't hold up - the crash kept coming back - because the
+   real fix was removing the AI controller from the picture entirely,
+   not timing its teardown more carefully. `start_walker_controller` in
+   `spawner.py` now only ever applies manual `WalkerControl` and returns
+   `None`; no controller actor is ever created, so there's nothing for
+   the crowd-nav manager to still consider active when destroy time
+   comes.
+8. **Ego vehicle + cameras are refreshed periodically within a chunk,
+   not kept for its entire length.** `EGO_REFRESH_EVERY_N_IMAGES` (200)
+   respawns the ego vehicle and both cameras every N images instead of
+   reusing the exact same sensor pair for a whole chunk, which could be
+   thousands of frames. The replacement is spawned *before* the current
+   one is destroyed, so a failed respawn attempt just skips that round
+   instead of leaving the chunk with no valid ego.
 
 ### Pedestrian bounding boxes drifting from the actual image
 
