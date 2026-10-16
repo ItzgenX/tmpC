@@ -2,7 +2,7 @@ import carla
 import random
 import math
 
-from utils import lerp_location, find_lane_waypoint, jitter_along_lane
+from utils import lerp_location, find_lane_waypoint, jitter_along_lane, distance_to_segment
 
 
 def spawn_actor(world, bp, transform, max_attempts=10, attach_to=None):
@@ -108,7 +108,8 @@ def spawn_pedestrian_on_sidewalk(world, pedestrian_bps, ego_transform, min_dist,
 def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_dist, max_dist,
                             lateral_range, lights_on, allowed_vehicles,
                             prefer_bike_lane=False, keep_away_from=None, keep_away_dist=0.0,
-                            min_spacing=3.5, max_attempts=20):
+                            min_spacing=3.5, max_attempts=20,
+                            avoid_segment=None, avoid_segment_dist=0.0):
     carla_map = world.get_map()
     spawned_vehicles = []
 
@@ -126,6 +127,8 @@ def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_d
         for other in keep_away_from:
             if other and other.is_alive and loc.distance(other.get_transform().location) < keep_away_dist:
                 return True
+        if avoid_segment and distance_to_segment(loc, avoid_segment[0], avoid_segment[1]) < avoid_segment_dist:
+            return True
         return False
 
     for _ in range(num_vehicles):

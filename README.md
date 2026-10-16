@@ -344,12 +344,22 @@ get discarded too.
 ```python
 MIN_SEPARATION_BETWEEN_VEHICLES = 3.5     # no two same-frame vehicles closer than this
 MIN_SEPARATION_TRUCK_TO_CYCLIST = 6.0     # trucks kept further from cyclists specifically
+CROSSWALK_VEHICLE_EXCLUSION_RADIUS = 2.0  # keeps traffic off the crosswalk stripe itself
 ```
 
 Vehicles are jittered along their lane's own right-vector (not raw x/y
 noise), so they stay parallel to the road instead of clipping sideways on
 a curve. Cyclists/scooters/motorcycles try a dedicated `LaneType.Biking`
 lane first if the map has one.
+
+On crosswalk buckets (not jaywalk), vehicles/trucks/cyclists are also kept
+at least `CROSSWALK_VEHICLE_EXCLUSION_RADIUS` away from the crosswalk's own
+crossing line, so a cyclist can no longer end up riding across the same
+marked crosswalk at the same moment the pedestrian is - that was happening
+because `find_lane_waypoint`'s bike-lane search had no awareness of where
+the crosswalk itself was. This doesn't hurt occlusion: an occluder just
+needs to overlap the pedestrian's 2D bbox from the camera's angle, which a
+vehicle a couple meters off the stripe still does fine.
 
 ```python
 ALLOWED_CAR_VEHICLES = [...]
@@ -535,6 +545,17 @@ things now address this:
    `stop()` right after, the same tightly-scoped pattern the original
    per-frame-respawn code used — just without respawning the actors
    themselves.
+7. **A tick between stopping a walker controller and destroying it.**
+   `destroy_frame_actors` calls `stop()` on every walker AI controller
+   before batch-destroying it and its pedestrian, but was destroying them
+   in the very same instant `stop()` was issued, with no `world.tick()`
+   in between for CARLA's crowd-nav manager to actually process that
+   stop. Yanking an actor out from under a controller the crowd manager
+   still considers "active" is exactly the same class of uncatchable
+   native crash as point 6 above, just intermittent rather than a fixed
+   threshold - it could surface anywhere, not consistently at the same
+   frame count. One `world.tick()` is now inserted after stopping
+   controllers and before the destroy batch runs.
 
 None of this can make Python relaunch a CarlaUE4 process that's actually
 dead — something (you, or a supervisor/systemd unit) still has to restart

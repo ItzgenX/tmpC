@@ -152,6 +152,9 @@ MIN_SEPARATION_BETWEEN_VEHICLES = 3.5
 MIN_SEPARATION_TRUCK_TO_CYCLIST = 6.0   # trucks kept further from bikes
 MAX_SPAWN_ATTEMPTS_PER_ACTOR = 20
 
+# keeps traffic off the marked crosswalk stripe itself (crosswalk buckets only)
+CROSSWALK_VEHICLE_EXCLUSION_RADIUS = 2.0
+
 
 # --- crash / disconnect resilience ---
 # keeps retrying a dropped connection instead of giving up. all progress is
