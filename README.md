@@ -508,21 +508,33 @@ things now address this:
    something else occlusion-related) versus any image type.
 
 5. **Ego vehicle and both cameras are no longer respawned every frame.**
-   The RGB and semantic segmentation cameras run at 4K
-   (3840x2160). Spawning and destroying a pair of 4K camera sensors (plus
-   the ego vehicle they're attached to) on every single frame leaks
-   native-side sensor/render resources in CARLA, and is what was causing
-   the client to core-dump after roughly 20-25 images regardless of
-   anything else in this list — the server stayed up throughout, which is
-   the signature of this specific leak. Now the ego vehicle and both
-   cameras are spawned exactly once per map chunk (both cameras start
-   `listen()`-ing immediately and keep listening for the whole chunk)
-   and reused for every frame in it: each frame just teleports the ego
-   vehicle to its next approach point and drains/refills the camera
-   queues, never respawning the sensors themselves. They're only
-   destroyed when the chunk ends, the map switches, or a reconnect
-   happens. This is what makes runs of 1000-2000+ images viable instead
-   of crashing every few dozen frames.
+   The RGB and semantic segmentation cameras run at 4K (3840x2160).
+   Spawning and destroying a pair of 4K camera sensors (plus the ego
+   vehicle they're attached to) on every single frame leaks native-side
+   sensor/render resources in CARLA, and is what was causing the client
+   to core-dump after roughly 20-25 images regardless of anything else
+   in this list — the server stayed up throughout, which is the
+   signature of this specific leak. Now the ego vehicle and both
+   cameras are spawned exactly once per map chunk and reused for every
+   frame in it: each frame just teleports the ego vehicle to its next
+   approach point, instead of respawning it. They're only destroyed
+   when the chunk ends, the map switches, or a reconnect happens.
+6. **Each frame's camera capture is its own short `listen()`/`stop()`
+   window, not left running for the whole chunk.** An earlier version of
+   this fix had both cameras call `listen()` once per chunk and stay
+   subscribed across every frame in it. That's unsafe: synchronous mode
+   only guarantees a sensor callback has finished by the time
+   `world.tick()` returns for *that* tick — it says nothing about a
+   `destroy()` issued much later (chunk end, map switch, reconnect)
+   never racing a callback still in flight on CARLA's native streaming
+   thread. That race throws a C++ exception on a thread Python's
+   `try/except` can't reach, which is an unconditional process abort —
+   `terminate called after throwing an instance of 'std::runtime_error'
+   ... trying to operate on destroyed actor ... Aborted (core dumped)`.
+   Each frame now calls `listen()` right before its capture ticks and
+   `stop()` right after, the same tightly-scoped pattern the original
+   per-frame-respawn code used — just without respawning the actors
+   themselves.
 
 None of this can make Python relaunch a CarlaUE4 process that's actually
 dead — something (you, or a supervisor/systemd unit) still has to restart
