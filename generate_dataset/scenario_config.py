@@ -166,6 +166,11 @@ RECONNECT_MAX_ATTEMPTS = 30    # None = retry forever
 POST_DESTROY_SETTLE_TICKS = 20
 POST_DESTROY_SETTLE_SECONDS = 0.3
 
+# respawns the ego vehicle + cameras after this many images in one chunk,
+# instead of reusing the same ones for the whole chunk indefinitely -
+# caps how long any single sensor/actor pair stays alive
+EGO_REFRESH_EVERY_N_IMAGES = 200
+
 
 # --- blueprint categories (CARLA 0.9.16 + vehicle.bh.rider) ---
 ALLOWED_CAR_VEHICLES = [
