@@ -139,18 +139,25 @@ def log_error(log_path, context, exc):
 
 
 def destroy_frame_actors(client, world, actors):
-    # ego vehicle and cameras live outside this now, reused per chunk
+    """
+    Ego vehicle and cameras live outside this now, reused per chunk.
+    Walker controllers are stopped and destroyed in their own batch,
+    separately from (and before) everything else, with a tick on each
+    side - a single shared tick wasn't enough margin for CARLA's crowd-nav
+    manager to let go of an actively-navigating pedestrian before it got
+    destroyed, which is an uncatchable native crash, not a Python one.
+    """
     controllers = [a for a in actors if a and a.is_alive and hasattr(a, 'type_id') and a.type_id.startswith('controller.')]
-    for actor in controllers:
-        actor.stop()
+    others = [a for a in actors if a and a.is_alive and a not in controllers]
 
     if controllers:
-        # lets the crowd-nav manager process the stop before the walker's
-        # destroyed out from under it - skipping this risked an uncatchable
-        # native crash on an actively-navigating pedestrian
+        for c in controllers:
+            c.stop()
+        world.tick()
+        client.apply_batch([carla.command.DestroyActor(c) for c in controllers if c.is_alive])
         world.tick()
 
-    commands = [carla.command.DestroyActor(actor) for actor in actors if actor and actor.is_alive]
+    commands = [carla.command.DestroyActor(a) for a in others if a.is_alive]
     if commands:
         client.apply_batch(commands)
 
