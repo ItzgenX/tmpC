@@ -336,6 +336,18 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
         for _ in range(10):
             world.tick()
 
+        # drain the backlog from those 10 ticks and take one fresh tick -
+        # labels are read right after this, so they need to match the exact
+        # tick the saved image came from, not an older queued one. without
+        # this, a walking pedestrian's box drifts from several steps of
+        # movement between the captured frame and the label read; stationary
+        # vehicles never showed it, which is why only the person looked wrong
+        while not image_queue.empty():
+            image_queue.get()
+        while not seg_queue.empty():
+            seg_queue.get()
+        world.tick()
+
         rgb_cam.stop()
         seg_cam.stop()
 

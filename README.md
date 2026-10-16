@@ -557,6 +557,20 @@ things now address this:
    frame count. One `world.tick()` is now inserted after stopping
    controllers and before the destroy batch runs.
 
+### Pedestrian bounding boxes drifting from the actual image
+
+Separate from the crash fixes above: each frame's capture ticks 10 times
+after `listen()` starts, which queues up 10 images (one per tick) -
+`image_queue.get()` was pulling the *first* (oldest) of those 10, while
+labels were then computed from actors' *current* transforms (after all 10
+ticks, plus whatever ticks ran after). A walking pedestrian moves during
+that gap, so their box ended up drawn where they'd walked to, not where
+they were in the saved image. Vehicles don't move (physics frozen, no
+controller), so this never showed up on them - only ever on people. Fixed
+by draining that backlog and taking one fresh tick right before grabbing
+the image, so the frame and the actor transforms used for labels come from
+the exact same tick.
+
 None of this can make Python relaunch a CarlaUE4 process that's actually
 dead — something (you, or a supervisor/systemd unit) still has to restart
 the server binary itself. What this guarantees is that once it's back up,
