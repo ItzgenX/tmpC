@@ -17,6 +17,7 @@ Everything lives in `generate_dataset/`:
 |---|---|
 | `scenario_config.py` | Every setting you'd want to change. Start here. |
 | `generate_scenarios.py` | The script you actually run. |
+| `run_until_done.ps1` | Runs `generate_scenarios.py` in a loop, auto-resuming after any crash (including native ones) until the full plan is done. See §2.1. |
 | `image_plan.py` | Turns the exact-quota split into a shuffled per-scenario image plan, persisted to disk so progress survives a crash. |
 | `spawner.py` | Spawns ego vehicle, traffic, cyclists/scooters/motorcycles, and walking pedestrians. |
 | `occlusion.py` | The occlusion placement search (where exactly to stand a pedestrian so they're covered by X%). |
@@ -83,10 +84,36 @@ python generate_scenarios.py --resume dataset_scenarios/default_split__current_m
 `scenario_config.py`); `--count` overrides `number_images_to_generate` on
 every scenario in `SCENARIOS` (so `--count 50` means 50 images for *each*
 scenario, not 50 total — see §8); `--resume` points at an existing run
-folder to continue exactly where it left off. Weather still cycles
+folder to continue exactly where it left off, or `--resume latest` to
+auto-pick the most recently modified one. Weather still cycles
 through the full `SCENARIOS` table regardless of `--mode`, so an
 `occlusion_only` or `jaywalk_only` batch still covers every configured
 weather condition, not just one.
+
+### 2.1 Running it reliably through crashes: `run_until_done.ps1`
+
+CARLA client-side native crashes (core dumps / aborts) kill the Python
+process outright — nothing inside `generate_scenarios.py` can catch or
+retry around that, by definition. But every image is persisted to disk
+the instant it's saved, so a crash only ever loses the one frame in
+flight, not the dataset. `run_until_done.ps1` turns that into a
+complete, hands-off pipeline: it runs `generate_scenarios.py`, and if
+the process exits for *any* reason other than success, it waits a few
+seconds and relaunches it with `--resume latest`, repeating until the
+full plan actually finishes.
+
+```powershell
+cd generate_dataset
+.\run_until_done.ps1                              # default mixed run
+.\run_until_done.ps1 -Mode occlusion_only -Count 100
+```
+
+`-Mode`/`-Count` only matter for the very first launch — every relaunch
+after that uses `--resume latest`, since the plan (and the split that
+was baked into it) already lives on disk. If it crashes 5 times in a
+row in under 8 seconds each, it stops and tells you to restart the
+CARLA server by hand instead of burning through retries — that pattern
+means the server itself is the problem, not a one-off client crash.
 
 ---
 
