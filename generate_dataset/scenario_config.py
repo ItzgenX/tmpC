@@ -59,15 +59,15 @@ SCENARIOS = [
     dict(
         name="clear",
         weather=carla.WeatherParameters.ClearNoon,
-        pedestrians=(1, 2), vehicles=(0, 1), cyclists_scooters=(0, 1), trucks=(0, 1),
-        allow_jaywalk=False, allow_occlusion=False,
+        pedestrians=(1, 3), vehicles=(0, 2), cyclists_scooters=(0, 2), trucks=(0, 1),
+        allow_jaywalk=True, allow_occlusion=True,
         number_images_to_generate=700,
     ),
     dict(
         name="partly_cloudy",
         weather=carla.WeatherParameters.CloudyNoon,
         pedestrians=(1, 3), vehicles=(0, 2), cyclists_scooters=(0, 2), trucks=(0, 1),
-        allow_jaywalk=True, allow_occlusion=False,
+        allow_jaywalk=True, allow_occlusion=True,
         number_images_to_generate=800,
     ),
     dict(
