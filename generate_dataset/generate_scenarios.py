@@ -149,10 +149,12 @@ def destroy_frame_actors(client, actors):
 
 
 def spawn_ego_and_cameras(world, vehicle_bp, rgb_camera_bp, seg_camera_bp, ego_transform):
-    # one ego + two cameras per chunk, reused every frame
+    # one ego + two cameras per chunk, reused every frame. not listening
+    # yet - each frame does its own brief listen()/stop() window, so a
+    # chunk-end destroy() can never race an in-flight sensor callback
     ego_vehicle = spawn_actor(world, vehicle_bp, ego_transform)
     if not ego_vehicle:
-        return None, None, None, None, None
+        return None, None, None
 
     for _ in range(15):
         world.tick()
@@ -163,12 +165,7 @@ def spawn_ego_and_cameras(world, vehicle_bp, rgb_camera_bp, seg_camera_bp, ego_t
     seg_cam = world.spawn_actor(seg_camera_bp, camera_transform, attach_to=ego_vehicle)
     world.tick()
 
-    image_queue = queue.Queue()
-    seg_queue = queue.Queue()
-    rgb_cam.listen(image_queue.put)
-    seg_cam.listen(seg_queue.put)
-
-    return ego_vehicle, rgb_cam, seg_cam, image_queue, seg_queue
+    return ego_vehicle, rgb_cam, seg_cam
 
 
 def destroy_ego_and_cameras(rgb_cam, seg_cam, ego_vehicle):
@@ -186,7 +183,6 @@ def destroy_ego_and_cameras(rgb_cam, seg_cam, ego_vehicle):
 
 def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
                         walker_controller_bp, ego_vehicle, rgb_cam, seg_cam,
-                        image_queue, seg_queue,
                         crossing_segments, spawn_points, crosswalk_centers,
                         scenario, dirs, frame_index, manifest_writer, map_label, bucket):
     # ego_vehicle/rgb_cam/seg_cam belong to the caller, just reposition/read here
@@ -318,14 +314,17 @@ def generate_one_frame(client, world, carla_map, blueprints, pedestrian_bps,
         for _ in range(warmup_ticks):
             world.tick()
 
-        # clear out stale frames queued from before this warmup
-        while not image_queue.empty():
-            image_queue.get()
-        while not seg_queue.empty():
-            seg_queue.get()
+        # listen/stop scoped tightly to this capture, not left on across frames
+        image_queue = queue.Queue()
+        seg_queue = queue.Queue()
+        rgb_cam.listen(image_queue.put)
+        seg_cam.listen(seg_queue.put)
 
         for _ in range(10):
             world.tick()
+
+        rgb_cam.stop()
+        seg_cam.stop()
 
         try:
             rgb_image = image_queue.get(timeout=10.0)
@@ -697,7 +696,7 @@ def main(cli_args=None):
                         pass
 
                 # one ego + cameras per chunk, reused every frame (fixes the core dump)
-                ego_vehicle, rgb_cam, seg_cam, image_queue, seg_queue = spawn_ego_and_cameras(
+                ego_vehicle, rgb_cam, seg_cam = spawn_ego_and_cameras(
                     world, vehicle_bp, rgb_camera_bp, seg_camera_bp, crossing_segments[0]['ego_transform']
                 )
                 if not ego_vehicle:
@@ -721,7 +720,6 @@ def main(cli_args=None):
                             saved = generate_one_frame(
                                 client, world, carla_map, blueprints, pedestrian_bps,
                                 walker_controller_bp, ego_vehicle, rgb_cam, seg_cam,
-                                image_queue, seg_queue,
                                 crossing_segments, spawn_points, crosswalk_centers,
                                 scenario, dirs, frame_index, manifest_writer, map_label, bucket
                             )
@@ -753,7 +751,7 @@ def main(cli_args=None):
                                     vehicle_bp, pedestrian_bps, walker_controller_bp, rgb_camera_bp, seg_camera_bp = actor_bps
                                     world.set_weather(scenario['weather'])
                                     carla_map, crossing_segments, crosswalk_centers, spawn_points = scan_map_geometry(world)
-                                    ego_vehicle, rgb_cam, seg_cam, image_queue, seg_queue = spawn_ego_and_cameras(
+                                    ego_vehicle, rgb_cam, seg_cam = spawn_ego_and_cameras(
                                         world, vehicle_bp, rgb_camera_bp, seg_camera_bp, crossing_segments[0]['ego_transform']
                                     )
                                     if not ego_vehicle:
