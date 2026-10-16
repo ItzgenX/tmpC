@@ -197,27 +197,18 @@ def spawn_pedestrian_only(world, pedestrian_bps, crossing_start, crossing_end, p
 
 def start_walker_controller(world, walker_controller_bp, pedestrian, start_loc, target_loc, yaw,
                              speed_range=(0.9, 1.6)):
-    # pedestrian must already be at its final transform
-    controller = None
-    speed = random.uniform(*speed_range)
-    try:
-        controller = world.spawn_actor(walker_controller_bp, carla.Transform(), attach_to=pedestrian)
-        world.tick()
-        controller.start()
-        beyond = lerp_location(start_loc, target_loc, 1.4)
-        controller.go_to_location(carla.Location(beyond.x, beyond.y, target_loc.z))
-        controller.set_max_speed(speed)
-    except RuntimeError:
-        if controller is not None and controller.is_alive:
-            controller.destroy()
-        controller = None
-        yaw_rad = math.radians(yaw)
-        control = carla.WalkerControl()
-        control.direction = carla.Vector3D(x=math.cos(yaw_rad), y=math.sin(yaw_rad))
-        control.speed = speed
-        pedestrian.apply_control(control)
-
-    return controller
+    # manual WalkerControl, not an AI controller.ai.walker actor - matches
+    # the original reference script. an AI controller ties the pedestrian
+    # into CARLA's crowd-nav manager, and destroying an actor the manager
+    # still considers active is an uncatchable native crash; manual
+    # control never involves that subsystem at all. always returns None
+    # since no controller actor gets spawned.
+    yaw_rad = math.radians(yaw)
+    control = carla.WalkerControl()
+    control.direction = carla.Vector3D(x=math.cos(yaw_rad), y=math.sin(yaw_rad))
+    control.speed = random.uniform(*speed_range)
+    pedestrian.apply_control(control)
+    return None
 
 
 def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
