@@ -1,230 +1,207 @@
+"""Spawns what the planner decided. No decisions are made here."""
 import carla
-import random
-import math
 
-from utils import lerp_location, find_lane_waypoint, jitter_along_lane, distance_to_segment
+import advanced as C
 
 
-def spawn_actor(world, bp, transform, max_attempts=10, attach_to=None):
-    for _ in range(max_attempts):
-        if attach_to:
-            actor = world.try_spawn_actor(bp, carla.Transform(), attach_to=attach_to)
-        else:
-            actor = world.try_spawn_actor(bp, transform)
-        if actor:
-            return actor
+class SpawnError(Exception):
+    pass
+
+
+# ---------- blueprints ----------
+
+def _attr(bp, name):
+    return bp.get_attribute(name).as_str().lower() if bp.has_attribute(name) else ""
+
+
+def walker_type(bp):
+    if bp.id in C.PED_TYPE_OVERRIDES:
+        return C.PED_TYPE_OVERRIDES[bp.id]
+    if _attr(bp, "age") == "child":
+        return "child"
+    gender = _attr(bp, "gender")
+    if gender == "female":
+        return "woman"
+    if gender == "male":
+        return "man"
     return None
 
 
-def random_location_in_camera_fov(ego_transform, min_dist=10, max_dist=20, lateral_range=5.0):
-    yaw_rad = math.radians(ego_transform.rotation.yaw)
-    forward = carla.Vector3D(x=math.cos(yaw_rad), y=math.sin(yaw_rad))
-    dist = random.uniform(min_dist, max_dist)
-    lateral = random.uniform(-lateral_range, lateral_range)
-    loc = ego_transform.location + forward * dist + carla.Vector3D(
-        x=-forward.y * lateral,
-        y=forward.x * lateral,
-        z=0
-    )
-    return loc
+def walker_pools(bp_lib):
+    pools = {"child": [], "woman": [], "man": []}
+    for bp in bp_lib.filter("walker.pedestrian.*"):
+        if bp.id in C.PED_BLUEPRINT_EXCLUDE:
+            continue
+        t = walker_type(bp)
+        if t in pools:
+            pools[t].append(bp.id)
+    return {k: sorted(v) for k, v in pools.items()}
 
 
-def spawn_pedestrian_on_sidewalk(world, pedestrian_bps, ego_transform, min_dist, max_dist):
-    max_attempts = 30
-    carla_map = world.get_map()
+def vehicle_pool(bp_lib, ids):
+    """{bp_id: [recommended colors]} for the ids that exist on this server."""
+    pool = {}
+    for bp_id in ids:
+        found = bp_lib.filter(bp_id)
+        if not found:
+            print(f"  warning: blueprint {bp_id} not on server, skipped")
+            continue
+        bp = found[0]
+        pool[bp.id] = list(bp.get_attribute("color").recommended_values) if bp.has_attribute("color") else []
+    return pool
 
 
-    for attempt in range(max_attempts):
-        test_loc = random_location_in_camera_fov(ego_transform, min_dist=min_dist, max_dist=max_dist, lateral_range=15.0)
-        wp_driving = carla_map.get_waypoint(test_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
-        sidewalk_loc = None
+def ego_blueprint(bp_lib):
+    found = bp_lib.filter(C.EGO_BLUEPRINT)
+    if found:
+        return found[0]
+    print(f"  warning: ego blueprint '{C.EGO_BLUEPRINT}' not found, using {C.EGO_FALLBACK_BLUEPRINT}")
+    return bp_lib.find(C.EGO_FALLBACK_BLUEPRINT)
 
 
-        if wp_driving:
-            curr = wp_driving
-            while curr is not None:
-                if curr.lane_type == carla.LaneType.Sidewalk:
-                    sidewalk_loc = curr.transform.location
-                    break
-                curr = curr.get_right_lane()
-               
-            if sidewalk_loc is None:
-                curr = wp_driving
-                while curr is not None:
-                    if curr.lane_type == carla.LaneType.Sidewalk:
-                        sidewalk_loc = curr.transform.location
-                        break
-                    curr = curr.get_left_lane()
+def _set_attrs(bp, attrs):
+    for k, v in attrs.items():
+        if bp.has_attribute(k):
+            bp.set_attribute(k, str(v))
 
 
-        if sidewalk_loc:
-            sidewalk_loc.x += random.uniform(-1.0, 1.0)
-            sidewalk_loc.y += random.uniform(-1.0, 1.0)
-           
-            spawn_transform = carla.Transform(
-                carla.Location(sidewalk_loc.x, sidewalk_loc.y, sidewalk_loc.z + 0.5),
-                carla.Rotation(yaw=random.uniform(-180, 180))
-            )
+def camera_blueprints(bp_lib):
+    rgb = bp_lib.find("sensor.camera.rgb")
+    _set_attrs(rgb, {
+        "image_size_x": C.IMAGE_W * C.RGB_SUPERSAMPLE, "image_size_y": C.IMAGE_H * C.RGB_SUPERSAMPLE,
+        "fov": C.CAMERA_FOV, "sensor_tick": 0.0, **C.RGB_ATTRIBUTES,
+    })
+    seg = bp_lib.find("sensor.camera.semantic_segmentation")
+    # rendered straight at output size, pixel-aligned with the downscaled RGB
+    _set_attrs(seg, {"image_size_x": C.IMAGE_W, "image_size_y": C.IMAGE_H,
+                     "fov": C.CAMERA_FOV, "sensor_tick": 0.0})
+    depth = bp_lib.find("sensor.camera.depth")
+    _set_attrs(depth, {"image_size_x": C.IMAGE_W, "image_size_y": C.IMAGE_H,
+                       "fov": C.CAMERA_FOV, "sensor_tick": 0.0})
+    return rgb, seg, depth
 
 
-            ped_bp = random.choice(pedestrian_bps)
-            pedestrian = spawn_actor(world, ped_bp, spawn_transform)
-            if pedestrian:
-                world.tick()
-                ped_yaw = math.radians(spawn_transform.rotation.yaw)
-                ped_forward = carla.Vector3D(x=math.cos(ped_yaw), y=math.sin(ped_yaw))
-                control = carla.WalkerControl()
-                control.direction = ped_forward
-                control.speed = random.uniform(0.8, 1.5)
-                pedestrian.apply_control(control)
-                return pedestrian, None
+# ---------- world housekeeping ----------
 
+def cleanup_world(client, world):
+    """Removes every vehicle, walker, sensor and controller, e.g. left by a crashed run.
 
-    for attempt in range(max_attempts):
-        loc = world.get_random_location_from_navigation()
-        if loc:
-            dist = loc.distance(ego_transform.location)
-            if dist < max_dist + 20.0:
-                spawn_transform = carla.Transform(
-                    carla.Location(loc.x, loc.y, loc.z + 0.5),
-                    carla.Rotation(yaw=random.uniform(-180, 180))
-                )
-                ped_bp = random.choice(pedestrian_bps)
-                pedestrian = spawn_actor(world, ped_bp, spawn_transform)
-                if pedestrian:
-                    world.tick()
-                    ped_yaw = math.radians(spawn_transform.rotation.yaw)
-                    ped_forward = carla.Vector3D(x=math.cos(ped_yaw), y=math.sin(ped_yaw))
-                    control = carla.WalkerControl()
-                    control.direction = ped_forward
-                    control.speed = random.uniform(0.8, 1.5)
-                    pedestrian.apply_control(control)
-                    return pedestrian, None
-
-
-    return None, None
-
-
-def spawn_traffic_vehicles(world, blueprints, ego_transform, num_vehicles, min_dist, max_dist,
-                            lateral_range, lights_on, allowed_vehicles,
-                            prefer_bike_lane=False, keep_away_from=None, keep_away_dist=0.0,
-                            min_spacing=3.5, max_attempts=20,
-                            avoid_segment=None, avoid_segment_dist=0.0):
-    carla_map = world.get_map()
-    spawned_vehicles = []
-
-    traffic_bps = [bp for bp in blueprints.filter('vehicle.*') if bp.id in allowed_vehicles]
-    if not traffic_bps:
-        print("no valid blueprints found for this category, skipping")
-        return []
-
-    keep_away_from = keep_away_from or []
-
-    def too_close(loc):
-        for other in spawned_vehicles:
-            if loc.distance(other.get_transform().location) < min_spacing:
-                return True
-        for other in keep_away_from:
-            if other and other.is_alive and loc.distance(other.get_transform().location) < keep_away_dist:
-                return True
-        if avoid_segment and distance_to_segment(loc, avoid_segment[0], avoid_segment[1]) < avoid_segment_dist:
-            return True
-        return False
-
-    for _ in range(num_vehicles):
-        for _ in range(max_attempts):
-            loc = random_location_in_camera_fov(ego_transform, min_dist=min_dist, max_dist=max_dist, lateral_range=lateral_range)
-            wp = find_lane_waypoint(carla_map, loc, prefer_bike_lane=prefer_bike_lane)
-            if not wp:
-                continue
-
-            # jitter along the lane's right vector, stays parallel on curves
-            candidate_loc = jitter_along_lane(wp, lateral_jitter=random.uniform(-0.4, 0.4))
-            candidate_loc.z += 0.5
-            if too_close(candidate_loc):
-                continue
-
-            t = carla.Transform(candidate_loc, wp.transform.rotation)
-            v_bp = random.choice(traffic_bps)
-            v_actor = spawn_actor(world, v_bp, t)
-            if v_actor:
-                if lights_on:
-                    try:
-                        v_actor.set_light_state(carla.VehicleLightState(carla.VehicleLightState.Position | carla.VehicleLightState.LowBeam))
-                    except Exception:
-                        pass
-                spawned_vehicles.append(v_actor)
-                break
-
-    for _ in range(15):
+    A crash leaves its cameras on the server still rendering every tick. Without
+    this they pile up with every auto-restart until the server itself falls over,
+    and leftover cars/people would show up unplanned (and mislabeled) in images.
+    """
+    actors = world.get_actors()
+    doomed = [a for pat in ("sensor.*", "controller.*", "walker.*", "vehicle.*") for a in actors.filter(pat)]
+    for s in actors.filter("sensor.*"):
+        try:
+            if s.is_listening:
+                s.stop()
+        except RuntimeError:
+            pass
+    if doomed:
+        print(f"  removing {len(doomed)} leftover actors from a previous run")
+        client.apply_batch_sync([carla.command.DestroyActor(a.id) for a in doomed], True)
         world.tick()
-    for v in spawned_vehicles:
-        v.set_simulate_physics(False)
-
-    return spawned_vehicles
 
 
-def spawn_pedestrian_only(world, pedestrian_bps, crossing_start, crossing_end, progress=None):
-    # actor only, no controller yet, so the occlusion search can reposition first
-    if progress is None:
-        progress = random.uniform(0.05, 0.35)
-
-    if random.random() < 0.5:
-        start_loc = lerp_location(crossing_start, crossing_end, progress)
-        target_loc = crossing_end
-        yaw = math.degrees(math.atan2(crossing_end.y - crossing_start.y, crossing_end.x - crossing_start.x))
-    else:
-        start_loc = lerp_location(crossing_end, crossing_start, progress)
-        target_loc = crossing_start
-        yaw = math.degrees(math.atan2(crossing_start.y - crossing_end.y, crossing_start.x - crossing_end.x))
-
-    spawn_transform = carla.Transform(
-        carla.Location(start_loc.x, start_loc.y, start_loc.z + 0.5),
-        carla.Rotation(yaw=yaw)
-    )
-
-    ped_bp = random.choice(pedestrian_bps)
-    if ped_bp.has_attribute('is_invincible'):
-        ped_bp.set_attribute('is_invincible', 'false')
-
-    pedestrian = spawn_actor(world, ped_bp, spawn_transform)
-    if not pedestrian:
-        return None, None, None, None
-
+def destroy_actors(client, world, actors):
+    ids = [a.id for a in actors if a is not None]
+    if ids:
+        client.apply_batch_sync([carla.command.DestroyActor(i) for i in ids], True)
     world.tick()
-    return pedestrian, start_loc, target_loc, yaw
 
 
-def start_walker_controller(world, walker_controller_bp, pedestrian, start_loc, target_loc, yaw,
-                             speed_range=(0.9, 1.6)):
-    # manual WalkerControl, not an AI controller.ai.walker actor - matches
-    # the original reference script. an AI controller ties the pedestrian
-    # into CARLA's crowd-nav manager, and destroying an actor the manager
-    # still considers active is an uncatchable native crash; manual
-    # control never involves that subsystem at all. always returns None
-    # since no controller actor gets spawned.
-    yaw_rad = math.radians(yaw)
-    control = carla.WalkerControl()
-    control.direction = carla.Vector3D(x=math.cos(yaw_rad), y=math.sin(yaw_rad))
-    control.speed = random.uniform(*speed_range)
-    pedestrian.apply_control(control)
-    return None
+# ---------- ego + cameras ----------
 
-
-def spawn_pedestrian_crossing(world, pedestrian_bps, walker_controller_bp,
-                               crossing_start, crossing_end,
-                               progress=None, speed_range=(0.9, 1.6)):
-    # spawn and start walking immediately, no repositioning needed
-    pedestrian, start_loc, target_loc, yaw = spawn_pedestrian_only(
-        world, pedestrian_bps, crossing_start, crossing_end, progress=progress
+def to_transform(d, z_offset=0.0):
+    return carla.Transform(
+        carla.Location(x=d["x"], y=d["y"], z=d["z"] + z_offset),
+        carla.Rotation(pitch=d.get("pitch", 0.0), yaw=d["yaw"], roll=d.get("roll", 0.0)),
     )
-    if not pedestrian:
-        return None, None
-
-    controller = start_walker_controller(
-        world, walker_controller_bp, pedestrian, start_loc, target_loc, yaw, speed_range=speed_range
-    )
-    return pedestrian, controller
 
 
+def spawn_ego_and_cameras(world, bp_lib, ego_pose):
+    """Spawned once per map. Returns (ego, rgb_cam, seg_cam, depth_cam or None, z_offset)."""
+    ego = None
+    for lift in (0.5, 1.0, 2.0):
+        ego = world.try_spawn_actor(ego_blueprint(bp_lib), to_transform(ego_pose, lift))
+        if ego:
+            break
+    if ego is None:
+        raise SpawnError("could not spawn ego vehicle")
+    for _ in range(20):         # let it drop onto the road, then freeze it
+        world.tick()
+    z_offset = ego.get_location().z - ego_pose["z"]
+    ego.set_simulate_physics(False)
 
+    rgb_bp, seg_bp, depth_bp = camera_blueprints(bp_lib)
+    cam_tf = carla.Transform(carla.Location(*C.CAMERA_LOCATION), carla.Rotation(pitch=C.CAMERA_PITCH))
+    rgb = world.spawn_actor(rgb_bp, cam_tf, attach_to=ego)
+    seg = world.spawn_actor(seg_bp, cam_tf, attach_to=ego)
+    depth = world.spawn_actor(depth_bp, cam_tf, attach_to=ego) if C.SAVE_DEPTH else None
+    world.tick()
+    return ego, rgb, seg, depth, z_offset
+
+
+def destroy_ego_and_cameras(client, world, ego, cams):
+    for c in cams:
+        try:
+            if c is not None and c.is_listening:
+                c.stop()
+        except RuntimeError:
+            pass
+    try:
+        world.tick()            # let in-flight sensor callbacks drain before destroy
+    except RuntimeError:
+        pass
+    destroy_actors(client, world, list(cams) + [ego])
+
+
+# ---------- scene actors ----------
+
+def spawn_vehicles(world, bp_lib, plan_vehicles, actors):
+    """Appends into `actors` as it goes, so the caller can always clean up."""
+    spawned = []
+    for v in plan_vehicles:
+        bp = bp_lib.find(v["blueprint"])
+        if v["color"] and bp.has_attribute("color"):
+            bp.set_attribute("color", v["color"])
+        if bp.has_attribute("role_name"):
+            bp.set_attribute("role_name", "traffic")
+        actor = world.try_spawn_actor(bp, to_transform(v, 0.3))
+        if actor is None:
+            raise SpawnError(f"vehicle {v['blueprint']} collided at spawn")
+        actors.append(actor)
+        spawned.append(actor)
+        actor.apply_control(carla.VehicleControl(hand_brake=True))
+    return spawned
+
+
+def freeze(actors):
+    for a in actors:
+        a.set_simulate_physics(False)
+
+
+def spawn_pedestrians(world, bp_lib, plan_peds, actors):
+    spawned = []
+    for p in plan_peds:
+        bp = bp_lib.find(p["blueprint"])
+        if bp.has_attribute("is_invincible"):
+            bp.set_attribute("is_invincible", "false")
+        if bp.has_attribute("use_wheelchair"):
+            bp.set_attribute("use_wheelchair", "false")
+        x, y, z = p["spawn"]
+        tf = carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(yaw=p["yaw"]))
+        actor = world.try_spawn_actor(bp, tf)
+        if actor is None:
+            raise SpawnError(f"pedestrian {p['blueprint']} collided at spawn")
+        actors.append(actor)
+        spawned.append(actor)
+    return spawned
+
+
+def start_walking(walkers, plan_peds):
+    # plain WalkerControl, no AI controller: nothing tied to the crowd-nav manager
+    for w, p in zip(walkers, plan_peds):
+        dx, dy = p["direction"]
+        w.apply_control(carla.WalkerControl(direction=carla.Vector3D(x=dx, y=dy, z=0.0), speed=p["speed"]))

@@ -6,3 +6,7 @@ ignore
 
 
 *__pycache__/
+
+# generated output
+dataset/
+dataset_scenarios/

@@ -1,749 +1,250 @@
-import os
+"""Camera math, segmentation-based labels, quality gates, file writing, drawing."""
+import json
 import math
-import random
-import numpy as np
-import carla
+import os
+
 import cv2
+import numpy as np
+
+import advanced as C
 
 
-def carla_to_yolo(bbox, img_w, img_h):
-    x_min, y_min, x_max, y_max = bbox
-    width = x_max - x_min
-    height = y_max - y_min
-    x_center = x_min + (width / 2.0)
-    y_center = y_min + (height / 2.0)
-    return [x_center / img_w, y_center / img_h, width / img_w, height / img_h]
+# ---------- camera ----------
+
+def intrinsics(width=C.IMAGE_W, height=C.IMAGE_H, fov=C.CAMERA_FOV):
+    f = width / (2.0 * math.tan(math.radians(fov) / 2.0))
+    return np.array([[f, 0, width / 2.0], [0, f, height / 2.0], [0, 0, 1.0]])
 
 
-def get_distance(loc1, loc2):
-    return math.sqrt(
-        (loc1.x - loc2.x)**2 +
-        (loc1.y - loc2.y)**2 +
-        (loc1.z - loc2.z)**2
-    )
+def project(points, world_to_cam, K):
+    """World points (N,3) -> pixels (N,2) and depth (N,). UE camera: x fwd, y right, z up."""
+    homog = np.hstack([points, np.ones((len(points), 1))])
+    cam = homog @ world_to_cam.T
+    depth = cam[:, 0]
+    safe = np.where(depth > 1e-3, depth, 1e-3)
+    u = K[0, 0] * cam[:, 1] / safe + K[0, 2]
+    v = -K[1, 1] * cam[:, 2] / safe + K[1, 2]
+    return np.stack([u, v], axis=1), depth, cam
 
 
-def distance_to_segment(loc, seg_start, seg_end):
-    # 2D distance from a point to a line segment
-    ax, ay = seg_start.x, seg_start.y
-    bx, by = seg_end.x, seg_end.y
-    dx, dy = bx - ax, by - ay
-    length_sq = dx * dx + dy * dy
-    if length_sq == 0:
-        return get_distance(loc, seg_start)
-    t = max(0.0, min(1.0, ((loc.x - ax) * dx + (loc.y - ay) * dy) / length_sq))
-    closest = carla.Location(x=ax + t * dx, y=ay + t * dy, z=loc.z)
-    return get_distance(loc, closest)
+def cam_coords(cam_xyz):
+    # UE (fwd, right, up) -> conventional camera (right, down, forward), KITTI style
+    return [float(cam_xyz[1]), float(-cam_xyz[2]), float(cam_xyz[0])]
 
 
-def get_world_corners(box):
-    # 8 corners of a static bounding box in world space
-    box_transform = carla.Transform(box.location, box.rotation)
-    ex, ey, ez = box.extent.x, box.extent.y, box.extent.z
-   
-    local_corners = [
-        carla.Location(ex, ey, ez), carla.Location(ex, -ey, ez),
-        carla.Location(-ex, ey, ez), carla.Location(-ex, -ey, ez),
-        carla.Location(ex, ey, -ez), carla.Location(ex, -ey, -ez),
-        carla.Location(-ex, ey, -ez), carla.Location(-ex, -ey, -ez)
-    ]
-   
-    world_corners = []
-    for corner in local_corners:
-        p = carla.Location(corner.x, corner.y, corner.z)
-        box_transform.transform(p)
-        world_corners.append(p)
-       
-    return world_corners
+# ---------- depth ----------
+
+def decode_depth(img):
+    """CARLA depth image -> float32 metres (H, W). Sky reads as ~1000 m."""
+    a = np.frombuffer(img.raw_data, dtype=np.uint8).reshape(img.height, img.width, 4).astype(np.float32)
+    return (a[:, :, 2] + a[:, :, 1] * 256.0 + a[:, :, 0] * 65536.0) / (256.0 ** 3 - 1) * 1000.0
 
 
-def project_vertices_to_2d(verts, world_to_camera, K, image_w, image_h):
-    # 3D world vertices to 2D image plane, drops anything behind the camera
-    points_2d = []
-    valid_depths = []
+def depth_to_png16(depth_m):
+    """uint16 PNG, 1 unit = 1 cm (max 655 m). Divide by 100 to get metres."""
+    return np.clip(np.round(depth_m * 100.0), 0, 65535).astype(np.uint16)
 
 
-    for v in verts:
-        world_point = np.array([v.x, v.y, v.z, 1.0])
-        p_camera = np.dot(world_to_camera, world_point)
+def depth_preview(depth_m, max_m=80.0):
+    """Colour preview, near = warm. Not for training."""
+    d = np.clip(depth_m, 0.0, max_m) / max_m
+    return cv2.applyColorMap((255 - d * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
 
 
-        # behind the camera, skip
-        if p_camera[0] <= 0:
+# ---------- segmentation labels ----------
+
+def _tight(mask, box):
+    x0, y0, x1, y1 = box
+    ys, xs = np.nonzero(mask[y0:y1, x0:x1])
+    if len(xs) == 0:
+        return None, None
+    return [int(x0 + xs.min()), int(y0 + ys.min()), int(x0 + xs.max() + 1), int(y0 + ys.max() + 1)], (ys + y0, xs + x0)
+
+
+def _search_box(box, w, h, grow=0.08):
+    x0, y0, x1, y1 = box
+    gx, gy = (x1 - x0) * grow, (y1 - y0) * grow
+    return [int(max(0, x0 - gx)), int(max(0, y0 - gy)), int(min(w, x1 + gx + 1)), int(min(h, y1 + gy + 1))]
+
+
+def _assign_pixels(objs, tag_masks, w, h):
+    """Near-first: each object takes its class pixels inside its projected box that a
+    nearer object has not already taken. Returns {index: (tight_box, pixel_count)}."""
+    claimed = np.zeros((h, w), dtype=bool)
+    out = {}
+    for i, o in sorted(enumerate(objs), key=lambda io: io[1]["depth"]):
+        mask = tag_masks[o["group"]] & ~claimed
+        sb = _search_box(o["proj_box"], w, h)
+        box, pix = _tight(mask, sb)
+        if box is None:
+            out[i] = (None, 0)
             continue
+        claimed[pix] = True
+        out[i] = (box, len(pix[0]))
+    return out
 
 
-        p_camera_std = np.array([
-            p_camera[1],
-            -p_camera[2],
-            p_camera[0]
-        ])
+def compute_labels(objects, seg, seg_full, hood, world_to_cam, K):
+    """Projects every candidate object and measures it against segmentation.
 
+    seg      = tags as rendered (traffic present)
+    seg_full = tags with our traffic moved away: each pedestrian's unoccluded
+               silhouette, giving the true full-body box and occlusion %
+    """
+    h, w = seg.shape
+    tags = C.SEG_TAGS
+    ped = np.isin(seg, tags["pedestrian"])
+    veh = np.isin(seg, tags["vehicle"]) & ~hood
+    masks = {"pedestrian": ped, "vehicle": veh}
+    masks_full = {"pedestrian": np.isin(seg_full, tags["pedestrian"]) if seg_full is not None else ped,
+                  "vehicle": veh}
 
-        p_image = np.dot(K, p_camera_std)
-        p_image /= p_image[2]
-
-
-        points_2d.append(p_image[:2])
-        valid_depths.append(p_camera[0])
-
-
-    return points_2d, valid_depths
-
-
-
-
-def is_bbox_valid(x_min, y_min, x_max, y_max,
-                  image_w, image_h,
-                  min_area=200,
-                  max_area_ratio=0.85,
-                  min_dim=10):
-    # rejects boxes off-frame, too small, too big, or a weird aspect ratio
-    if x_max <= 0 or y_max <= 0:
-        return False
-    if x_min >= image_w or y_min >= image_h:
-        return False
-
-
-    w = x_max - x_min
-    h = y_max - y_min
-
-
-    # Minimum dimension check
-    if w < min_dim or h < min_dim:
-        return False
-
-
-    area = w * h
-    image_area = image_w * image_h
-
-
-    if area < min_area:
-        return False
-
-    if area > max_area_ratio * image_area:
-        return False
-
-    aspect = w / (h + 1e-6)
-    if aspect > 10.0 or aspect < 0.1:
-        return False
-
-
-    return True
-
-
-
-
-def build_camera_intrinsics(camera):
-    image_w = int(camera.attributes['image_size_x'])
-    image_h = int(camera.attributes['image_size_y'])
-    fov = float(camera.attributes['fov'])
-    focal = image_w / (2.0 * np.tan(fov * np.pi / 360.0))
-    K = np.array([
-        [focal, 0,     image_w / 2.0],
-        [0,     focal, image_h / 2.0],
-        [0,     0,     1.0]
-    ])
-    return K, image_w, image_h
-
-
-
-
-def is_visible_and_not_occluded(world, camera, actor_or_loc, max_distance):
-    # raycast occlusion check, works for both a live actor and a bare location
-    if hasattr(actor_or_loc, 'get_transform'):
-        actor_loc = actor_or_loc.get_transform().location
-    elif hasattr(actor_or_loc, 'transform'):
-        actor_loc = actor_or_loc.transform.location
-    else:
-        actor_loc = actor_or_loc
-
-
-    cam_loc = camera.get_transform().location
-
-    # lift the ray target a bit so it doesn't clip the ground/road mesh
-    ray_target = carla.Location(actor_loc.x, actor_loc.y, actor_loc.z + 0.8)
-    dist = get_distance(cam_loc, ray_target)
-
-
-    if dist > max_distance:
-        return False
-
-
-    ray_hits = world.cast_ray(cam_loc, ray_target)
-    for hit in ray_hits:
-        label_str = str(hit.label).split('.')[-1]
-        if label_str in ['Buildings', 'Walls', 'Fences', 'Vegetation', 'Other']:
-            hit_dist = get_distance(cam_loc, hit.location)
-            if hit_dist < dist - 2.5:
-                return False
-    return True
-
-
-
-
-def get_all_vehicle_bboxes(world, camera, max_distance=50.0,
-                            min_area=200, check_occlusion=True,
-                            min_vertices_in_front=2):
-    # combines dynamic vehicles with static/parked ones into one bbox list
-    K, image_w, image_h = build_camera_intrinsics(camera)
-    cam_transform = camera.get_transform()
-    world_to_camera = np.array(cam_transform.get_inverse_matrix())
-    cam_loc = cam_transform.location
-
-
-    results = []
-
-
-    # dynamic vehicles first
-    dynamic_actors = world.get_actors().filter('vehicle.*')
-
-
-    for actor in dynamic_actors:
-        actor_loc = actor.get_transform().location
-        dist = get_distance(cam_loc, actor_loc)
-
-
-        if dist > max_distance:
+    cand = []
+    for o in objects:
+        uv, depth, cam = project(o["verts"], world_to_cam, K)
+        c_uv, c_depth, c_cam = project(np.array([o["center"]]), world_to_cam, K)
+        if c_depth[0] <= 0.5 or c_depth[0] > C.MAX_LABEL_DISTANCE or (depth > 0.1).sum() < 2:
             continue
-
-
-        # Occlusion check
-        if check_occlusion:
-            if not is_visible_and_not_occluded(
-                world, camera, actor_loc, max_distance
-            ):
-                continue
-
-
-        bb = actor.bounding_box
-        verts = bb.get_world_vertices(actor.get_transform())
-
-
-        points_2d, valid_depths = project_vertices_to_2d(
-            verts, world_to_camera, K, image_w, image_h
-        )
-
-
-        # need a few vertices in front of the camera, else projection is garbage
-        if len(points_2d) < min_vertices_in_front:
+        front = uv[depth > 0.1]
+        raw = [front[:, 0].min(), front[:, 1].min(), front[:, 0].max(), front[:, 1].max()]
+        if raw[2] < 0 or raw[3] < 0 or raw[0] > w or raw[1] > h:
             continue
-
-        points_2d = np.array(points_2d)
-
-        # skip anything that's fully off-frame before we clip it into a box
-        if (np.max(points_2d[:, 0]) < 0 or np.min(points_2d[:, 0]) > image_w or
-            np.max(points_2d[:, 1]) < 0 or np.min(points_2d[:, 1]) > image_h):
+        clipped = [int(max(0, raw[0])), int(max(0, raw[1])), int(min(w, raw[2])), int(min(h, raw[3]))]
+        if clipped[2] - clipped[0] < 2 or clipped[3] - clipped[1] < 2:
             continue
-
-        x_min = int(np.clip(np.min(points_2d[:, 0]), 0, image_w))
-        y_min = int(np.clip(np.min(points_2d[:, 1]), 0, image_h))
-        x_max = int(np.clip(np.max(points_2d[:, 0]), 0, image_w))
-        y_max = int(np.clip(np.max(points_2d[:, 1]), 0, image_h))
-
-        if not is_bbox_valid(x_min, y_min, x_max, y_max,
-                              image_w, image_h, min_area=min_area):
-            continue
-
-        results.append({
-            'bbox':     [x_min, y_min, x_max, y_max],
-            'label':    'Vehicle',
-            'type':     'dynamic',
-            'id':       actor.id,
-            'type_id':  actor.type_id,
-            'distance': dist,
-            'actor_obj': actor
+        o = dict(o)
+        o.update({
+            "group": "pedestrian" if o["kind"] == "pedestrian" else "vehicle",
+            "proj_box": clipped, "depth": float(c_depth[0]),
+            "truncated": bool(raw[0] < 0 or raw[1] < 0 or raw[2] > w or raw[3] > h or (depth <= 0.1).any()),
+            "corners_2d": [[round(float(x), 1), round(float(y), 1)] if d > 0.1 else None
+                           for (x, y), d in zip(uv, depth)],
+            "cam_xyz": c_cam[0],
         })
+        cand.append(o)
 
+    visible = _assign_pixels(cand, masks, w, h)
+    full = _assign_pixels(cand, masks_full, w, h)
 
-    # then the static/parked vehicles baked into the map itself
-    env_objects = []
-    if hasattr(carla.CityObjectLabel, 'Vehicles'):
-        env_objects.extend(world.get_environment_objects(carla.CityObjectLabel.Vehicles))
-    else:
-        for label_str in ['Car', 'Truck', 'Bus', 'Motorcycle', 'Bicycle']:
-            if hasattr(carla.CityObjectLabel, label_str):
-                env_objects.extend(world.get_environment_objects(getattr(carla.CityObjectLabel, label_str)))
-
-
-    for obj in env_objects:
-        bb = obj.bounding_box
-       
-        # Filter out broken map assets with zero volume
-        if bb.extent.x == 0 or bb.extent.y == 0:
+    labels = []
+    for i, o in enumerate(cand):
+        vis_box, vis_px = visible[i]
+        min_px = C.MIN_VISIBLE_PIXELS[o["kind"]]
+        if vis_box is None or vis_px < min_px:
             continue
-           
-        verts = get_world_corners(bb)
-        if not verts:
+        if min(vis_box[2] - vis_box[0], vis_box[3] - vis_box[1]) < C.MIN_BOX_SIZE_PX:
             continue
-
-
-        # average corners for world center, obj.transform can be (0,0,0) here
-        center_x = sum(v.x for v in verts) / len(verts)
-        center_y = sum(v.y for v in verts) / len(verts)
-        center_z = sum(v.z for v in verts) / len(verts)
-        obj_world_loc = carla.Location(x=center_x, y=center_y, z=center_z)
-       
-        dist = get_distance(cam_loc, obj_world_loc)
-
-
-        if dist > max_distance:
-            continue
-
-
-        # Occlusion check
-        if check_occlusion:
-            if not is_visible_and_not_occluded(
-                world, camera, obj_world_loc, max_distance
-            ):
-                continue
-
-
-        points_2d, valid_depths = project_vertices_to_2d(
-            verts, world_to_camera, K, image_w, image_h
-        )
-
-
-        if len(points_2d) < min_vertices_in_front:
-            continue
-
-        points_2d = np.array(points_2d)
-
-        if (np.max(points_2d[:, 0]) < 0 or np.min(points_2d[:, 0]) > image_w or
-            np.max(points_2d[:, 1]) < 0 or np.min(points_2d[:, 1]) > image_h):
-            continue
-
-        x_min = int(np.clip(np.min(points_2d[:, 0]), 0, image_w))
-        y_min = int(np.clip(np.min(points_2d[:, 1]), 0, image_h))
-        x_max = int(np.clip(np.max(points_2d[:, 0]), 0, image_w))
-        y_max = int(np.clip(np.max(points_2d[:, 1]), 0, image_h))
-
-        if not is_bbox_valid(x_min, y_min, x_max, y_max,
-                              image_w, image_h, min_area=min_area):
-            continue
-
-        results.append({
-            'bbox':     [x_min, y_min, x_max, y_max],
-            'label':    'Vehicle',
-            'type':     'static',
-            'id':       obj.id,
-            'type_id':  obj.name,
-            'distance': dist,
-            'actor_obj': obj
+        full_box, full_px = full[i]
+        if o["kind"] == "pedestrian" and full_box is not None:
+            full_px = max(full_px, vis_px)
+            full_box = [min(full_box[0], vis_box[0]), min(full_box[1], vis_box[1]),
+                        max(full_box[2], vis_box[2]), max(full_box[3], vis_box[3])]
+            occlusion = round(1.0 - vis_px / full_px, 3)
+        else:
+            full_box, full_px, occlusion = None, None, None
+        labels.append({
+            **{k: o[k] for k in ("kind", "source", "meta", "truncated", "corners_2d", "depth")},
+            "bbox_visible": vis_box,
+            "bbox_full": full_box,
+            "bbox_projected": o["proj_box"],
+            "visible_pixels": int(vis_px),
+            "full_pixels": int(full_px) if full_px is not None else None,
+            "occlusion": occlusion,
+            "location_world": [round(v, 3) for v in o["center"]],
+            "rotation_world": {"pitch": o["rotation"][0], "yaw": o["rotation"][1], "roll": o["rotation"][2]},
+            "dimensions": {"length": 2 * o["extent"][0], "width": 2 * o["extent"][1], "height": 2 * o["extent"][2]},
+            "location_camera": [round(v, 3) for v in cam_coords(o["cam_xyz"])],
         })
+    return labels
 
 
-    return results
+def road_fraction(seg, hood):
+    keep = ~hood
+    return float((np.isin(seg, C.SEG_TAGS["road_like"]) & keep).sum()) / max(1, int(keep.sum()))
 
 
+def hood_mask(seg_frames):
+    """Ego bonnet = vehicle pixels in the lower image present in every given frame."""
+    mask = None
+    for seg in seg_frames:
+        m = np.isin(seg, C.SEG_TAGS["vehicle"])
+        m[: int(seg.shape[0] * 0.6), :] = False
+        mask = m if mask is None else (mask & m)
+    return mask
 
 
-def get_actor_label(actor):
-    if hasattr(actor, 'type_id'):
-        if 'walker.pedestrian' in actor.type_id:
-            return 'Pedestrian'
-        if 'vehicle' in actor.type_id:
-            return 'Vehicle'
-    elif hasattr(actor, 'type'):
-        type_name = str(actor.type).split('.')[-1]
-        if type_name in ['Vehicles', 'Car', 'Truck',
-                         'Bus', 'Motorcycle', 'Bicycle']:
-            return 'Vehicle'
-    return 'Actor'
+# ---------- outputs ----------
+
+def class_id(label):
+    names = C.class_names()
+    if label["kind"] == "pedestrian":
+        if C.SPLIT_CROSSING_CLASS and label["meta"].get("role") == "crossing":
+            return names.index("crossing_pedestrian")
+        return names.index("pedestrian")
+    return names.index(label["kind"])
 
 
-
-
-def get_2d_bbox_from_3d(actor, camera):
-    # projects an actor's 3D bbox onto the camera plane
-    K, image_w, image_h = build_camera_intrinsics(camera)
-    cam_transform = camera.get_transform()
-    world_to_camera = np.array(cam_transform.get_inverse_matrix())
-
-
-    bb = actor.bounding_box
-    if hasattr(actor, 'get_transform'):
-        verts = bb.get_world_vertices(actor.get_transform())
-    else:
-        verts = get_world_corners(bb)
-
-
-    points_2d, valid_depths = project_vertices_to_2d(
-        verts, world_to_camera, K, image_w, image_h
-    )
-
-
-    if len(points_2d) < 2:
-        return None
-
-
-    points_2d = np.array(points_2d)
-
-
-    if (np.max(points_2d[:, 0]) < 0 or np.min(points_2d[:, 0]) > image_w or
-        np.max(points_2d[:, 1]) < 0 or np.min(points_2d[:, 1]) > image_h):
-        return None
-
-
-    x_min = int(np.clip(np.min(points_2d[:, 0]), 0, image_w))
-    y_min = int(np.clip(np.min(points_2d[:, 1]), 0, image_h))
-    x_max = int(np.clip(np.max(points_2d[:, 0]), 0, image_w))
-    y_max = int(np.clip(np.max(points_2d[:, 1]), 0, image_h))
-
-
-    if not is_bbox_valid(x_min, y_min, x_max, y_max, image_w, image_h, min_area=100, min_dim=5):
-        return None
-
-
-    return [x_min, y_min, x_max, y_max]
-
-
-
-
-def draw_3d_bbox_on_image(img, actor, camera, color=(0, 255, 255), thickness=2):
-    # draws a 3D bbox overlay, rescaling if img and camera resolution differ
-    K, image_w, image_h = build_camera_intrinsics(camera)
-    cam_transform = camera.get_transform()
-    world_to_camera = np.array(cam_transform.get_inverse_matrix())
-
-
-    bb = actor.bounding_box
-    if hasattr(actor, 'get_transform'):
-        verts = bb.get_world_vertices(actor.get_transform())
-    else:
-        verts = get_world_corners(bb)
-
-
-    if not verts:
-        return
-
-
-    points_2d = []
-    scale_x = img.shape[1] / image_w
-    scale_y = img.shape[0] / image_h
-
-
-    for v in verts:
-        world_point = np.array([v.x, v.y, v.z, 1.0])
-        p_camera = np.dot(world_to_camera, world_point)
-
-
-        if p_camera[0] <= 0:
-            points_2d.append(None)
+def yolo_lines(labels, ped_box):
+    lines = []
+    for lb in labels:
+        if lb["kind"] != "pedestrian" and not C.LABEL_VEHICLES:
             continue
-
-
-        p_camera_std = np.array([p_camera[1], -p_camera[2], p_camera[0]])
-        p_image = np.dot(K, p_camera_std)
-        p_image /= p_image[2]
-
-
-        points_2d.append((int(p_image[0] * scale_x), int(p_image[1] * scale_y)))
-
-
-    # Edges mapped using CARLA's get_world_vertices output order
-    edges = [(0, 2), (2, 6), (6, 4), (4, 0), (1, 3), (3, 7), (7, 5), (5, 1), (0, 1), (2, 3), (4, 5), (6, 7)]
-
-
-    for p1_idx, p2_idx in edges:
-        p1, p2 = points_2d[p1_idx], points_2d[p2_idx]
-        if p1 is not None and p2 is not None:
-            cv2.line(img, p1, p2, color, thickness)
-
-
-
-
-def draw_2d_bbox_on_image(img, bbox, color=(0, 255, 0), thickness=2):
-    if bbox is not None:
-        cv2.rectangle(img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, thickness)
-
-
-
-
-def save_dataset_sample(img, vehicles_info, camera, output_dir, frame_id):
-    # saves raw/2D/3D images and YOLO labels into separate folders
-    raw_dir = os.path.join(output_dir, "raw_images")
-    img_2d_dir = os.path.join(output_dir, "images_2d_bbox")
-    img_3d_dir = os.path.join(output_dir, "images_3d_bbox")
-    labels_2d_dir = os.path.join(output_dir, "labels_2d")
-
-    for folder in [raw_dir, img_2d_dir, img_3d_dir, labels_2d_dir]:
-        os.makedirs(folder, exist_ok=True)
-
-    img_w = img.shape[1]
-    img_h = img.shape[0]
-    frame_name = f"{frame_id:06d}"
-
-    raw_img_path = os.path.join(raw_dir, f"{frame_name}.png")
-    cv2.imwrite(raw_img_path, img)
-
-    img_2d = img.copy()
-    yolo_labels = []
-    for v in vehicles_info:
-        bbox = v['bbox']
-        draw_2d_bbox_on_image(img_2d, bbox, color=(0, 255, 0), thickness=2)
-        yolo_box = carla_to_yolo(bbox, img_w, img_h)
-        yolo_labels.append(f"0 {yolo_box[0]:.6f} {yolo_box[1]:.6f} {yolo_box[2]:.6f} {yolo_box[3]:.6f}")
-
-    cv2.imwrite(os.path.join(img_2d_dir, f"{frame_name}.png"), img_2d)
-
-    label_path = os.path.join(labels_2d_dir, f"{frame_name}.txt")
-    with open(label_path, "w") as f:
-        f.write("\n".join(yolo_labels))
-
-    img_3d = img.copy()
-    for v in vehicles_info:
-        actor_obj = v['actor_obj']
-        draw_3d_bbox_on_image(img_3d, actor_obj, camera, color=(0, 255, 255), thickness=2)
-   
-    cv2.imwrite(os.path.join(img_3d_dir, f"{frame_name}.png"), img_3d)
-
-
-
-
-def get_crosswalk_approach_transforms(carla_map,
-                                       min_dist=2.0,
-                                       max_dist=10.0):
-    crosswalks = []
-    current_polygon = []
-    for point in carla_map.get_crosswalks():
-        current_polygon.append(point)
-        if len(current_polygon) > 2 and point == current_polygon[0]:
-            center = carla.Location(
-                x=sum(p.x for p in current_polygon) / len(current_polygon),
-                y=sum(p.y for p in current_polygon) / len(current_polygon),
-                z=sum(p.z for p in current_polygon) / len(current_polygon)
-            )
-            crosswalks.append(center)
-            current_polygon = []
-
-
-    valid_transforms = []
-    for cw_center in crosswalks:
-        cw_waypoint = carla_map.get_waypoint(
-            cw_center,
-            project_to_road=True,
-            lane_type=carla.LaneType.Driving
-        )
-        if cw_waypoint:
-            dist = random.uniform(min_dist, max_dist)
-            prev_wps = cw_waypoint.previous(dist)
-            t = prev_wps[0].transform if prev_wps else cw_waypoint.transform
-            t.location.z += 0.5
-            valid_transforms.append((t, cw_center))
-    return valid_transforms
-
-
-def lerp_location(a, b, t):
-    return carla.Location(
-        x=a.x + (b.x - a.x) * t,
-        y=a.y + (b.y - a.y) * t,
-        z=a.z + (b.z - a.z) * t
-    )
-
-
-def get_crosswalk_crossing_segments(carla_map, ego_min_dist=5.0, ego_max_dist=12.0):
-    # per crosswalk: the two crossing endpoints plus an ego approach transform
-    segments = []
-    current_polygon = []
-    for point in carla_map.get_crosswalks():
-        current_polygon.append(point)
-        if len(current_polygon) > 2 and point == current_polygon[0]:
-            corners = current_polygon[:-1]
-            if len(corners) < 3:
-                current_polygon = []
-                continue
-
-            center = carla.Location(
-                x=sum(p.x for p in corners) / len(corners),
-                y=sum(p.y for p in corners) / len(corners),
-                z=sum(p.z for p in corners) / len(corners)
-            )
-
-            wp = carla_map.get_waypoint(center, project_to_road=True, lane_type=carla.LaneType.Driving)
-            if wp:
-                yaw_rad = math.radians(wp.transform.rotation.yaw)
-                road_dir_x, road_dir_y = math.cos(yaw_rad), math.sin(yaw_rad)
-                cross_dir_x, cross_dir_y = -road_dir_y, road_dir_x
-
-                side_a, side_b = [], []
-                for p in corners:
-                    rel_x, rel_y = p.x - center.x, p.y - center.y
-                    proj = rel_x * cross_dir_x + rel_y * cross_dir_y
-                    (side_a if proj >= 0 else side_b).append(p)
-
-                if side_a and side_b:
-                    def avg(pts):
-                        return carla.Location(
-                            x=sum(pp.x for pp in pts) / len(pts),
-                            y=sum(pp.y for pp in pts) / len(pts),
-                            z=sum(pp.z for pp in pts) / len(pts)
-                        )
-
-                    start = avg(side_a)
-                    end = avg(side_b)
-
-                    dist = random.uniform(ego_min_dist, ego_max_dist)
-                    prev_wps = wp.previous(dist)
-                    ego_transform = prev_wps[0].transform if prev_wps else wp.transform
-                    ego_transform.location.z += 0.5
-
-                    segments.append({
-                        'start': start,
-                        'end': end,
-                        'center': center,
-                        'ego_transform': ego_transform
-                    })
-            current_polygon = []
-    return segments
-
-
-# occlusion placement search lives in occlusion.py now
-
-
-def should_use_lights(weather_params):
-    # reads the weather object directly, works for custom weather too
-    return (weather_params.cloudiness > 40 or weather_params.precipitation > 0
-            or weather_params.fog_density > 5 or weather_params.sun_altitude_angle < 30)
-
-
-def lane_right_vector(waypoint):
-    # unit vector to the right of travel, for lateral offsets along the lane
-    yaw_rad = math.radians(waypoint.transform.rotation.yaw)
-    forward_x, forward_y = math.cos(yaw_rad), math.sin(yaw_rad)
-    return -forward_y, forward_x
-
-
-def jitter_along_lane(waypoint, lateral_jitter=0.0, forward_jitter=0.0):
-    right_x, right_y = lane_right_vector(waypoint)
-    yaw_rad = math.radians(waypoint.transform.rotation.yaw)
-    forward_x, forward_y = math.cos(yaw_rad), math.sin(yaw_rad)
-    loc = waypoint.transform.location
-    return carla.Location(
-        x=loc.x + right_x * lateral_jitter + forward_x * forward_jitter,
-        y=loc.y + right_y * lateral_jitter + forward_y * forward_jitter,
-        z=loc.z
-    )
-
-
-def find_lane_waypoint(carla_map, loc, prefer_bike_lane=False, max_bike_lane_dist=4.0):
-    # bike lane first if close enough, else the driving lane
-    if prefer_bike_lane:
-        bike_wp = carla_map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Biking)
-        if bike_wp and bike_wp.transform.location.distance(loc) <= max_bike_lane_dist:
-            return bike_wp
-    return carla_map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Driving)
-
-
-def get_crosswalk_centers(carla_map):
-    centers = []
-    current_polygon = []
-    for point in carla_map.get_crosswalks():
-        current_polygon.append(point)
-        if len(current_polygon) > 2 and point == current_polygon[0]:
-            corners = current_polygon[:-1]
-            if corners:
-                centers.append(carla.Location(
-                    x=sum(p.x for p in corners) / len(corners),
-                    y=sum(p.y for p in corners) / len(corners),
-                    z=sum(p.z for p in corners) / len(corners)
-                ))
-            current_polygon = []
-    return centers
-
-
-def is_far_from_all_crosswalks(loc, crosswalk_centers, min_dist):
-    for c in crosswalk_centers:
-        if get_distance(loc, c) < min_dist:
-            return False
-    return True
-
-
-def find_jaywalk_waypoint(carla_map, spawn_points, crosswalk_centers, exclusion_radius, max_attempts=40):
-    # only valid if no crosswalk is near enough to show up in frame
-    for _ in range(max_attempts):
-        candidate = random.choice(spawn_points)
-        if is_far_from_all_crosswalks(candidate.location, crosswalk_centers, exclusion_radius):
-            wp = carla_map.get_waypoint(candidate.location, project_to_road=True, lane_type=carla.LaneType.Driving)
-            if wp:
-                return wp
-    return None
-
-
-def get_full_road_crossing_segment(waypoint, shoulder_margin=1.5, max_lanes_each_side=6):
-    # finds the true road edges on both sides, so a jaywalker crosses the whole street
-    right_x, right_y = lane_right_vector(waypoint)
-    loc = waypoint.transform.location
-
-    left_extent = waypoint.lane_width / 2.0
-    curr = waypoint.get_left_lane()
-    count = 0
-    while curr is not None and curr.lane_type == carla.LaneType.Driving and count < max_lanes_each_side:
-        left_extent += curr.lane_width
-        curr = curr.get_left_lane()
-        count += 1
-
-    right_extent = waypoint.lane_width / 2.0
-    curr = waypoint.get_right_lane()
-    count = 0
-    while curr is not None and curr.lane_type == carla.LaneType.Driving and count < max_lanes_each_side:
-        right_extent += curr.lane_width
-        curr = curr.get_right_lane()
-        count += 1
-
-    start = carla.Location(
-        x=loc.x - right_x * (left_extent + shoulder_margin),
-        y=loc.y - right_y * (left_extent + shoulder_margin),
-        z=loc.z
-    )
-    end = carla.Location(
-        x=loc.x + right_x * (right_extent + shoulder_margin),
-        y=loc.y + right_y * (right_extent + shoulder_margin),
-        z=loc.z
-    )
-    return start, end
-
-
-def resolve_scenario_counts(scenario, min_optional_satisfied=2, require_pedestrian=True,
-                            max_rerolls=8, occluded_this_image=False):
-    # rolls actor counts, re-rolling until the variety bar is cleared
-    def roll(key):
-        lo, hi = scenario[key]
-        return random.randint(lo, hi)
-
-    def count_satisfied(counts):
-        return sum([
-            counts['vehicles'] > 0,
-            counts['cyclists_scooters'] > 0,
-            counts['trucks'] > 0,
-            occluded_this_image,
-        ])
-
-    best_counts = None
-    for _ in range(max_rerolls):
-        counts = {
-            'pedestrians': roll('pedestrians'),
-            'vehicles': roll('vehicles'),
-            'cyclists_scooters': roll('cyclists_scooters'),
-            'trucks': roll('trucks'),
-        }
-        if require_pedestrian and counts['pedestrians'] < 1:
-            continue
-        if count_satisfied(counts) >= min_optional_satisfied:
-            return counts
-        if best_counts is None:
-            best_counts = counts
-
-    counts = best_counts or {'pedestrians': 1, 'vehicles': 0, 'cyclists_scooters': 0, 'trucks': 0}
-    if require_pedestrian and counts['pedestrians'] < 1:
-        counts['pedestrians'] = 1
-
-    for key in ['vehicles', 'cyclists_scooters', 'trucks']:
-        if count_satisfied(counts) >= min_optional_satisfied:
-            break
-        lo, hi = scenario[key]
-        if hi > 0:
-            counts[key] = max(counts[key], 1)
-
-    return counts
-
+        box = lb["bbox_full"] if (lb["kind"] == "pedestrian" and ped_box == "full" and lb["bbox_full"]) \
+            else lb["bbox_visible"]
+        x0, y0, x1, y1 = box
+        lines.append(f"{class_id(lb)} {(x0 + x1) / 2 / C.IMAGE_W:.6f} {(y0 + y1) / 2 / C.IMAGE_H:.6f} "
+                     f"{(x1 - x0) / C.IMAGE_W:.6f} {(y1 - y0) / C.IMAGE_H:.6f}")
+    return lines
+
+
+def write_text_atomic(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def write_json_atomic(path, data):
+    write_text_atomic(path, json.dumps(data, indent=1, default=_json_default))
+
+
+def _json_default(o):
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(type(o))
+
+
+def write_image(path, img):
+    params = [cv2.IMWRITE_JPEG_QUALITY, C.JPEG_QUALITY] if path.endswith(".jpg") else []
+    if not cv2.imwrite(path, img, params):
+        raise IOError(f"could not write {path}")
+
+
+# ---------- debug drawing ----------
+
+EDGES = [(i, j) for i in range(8) for j in range(i + 1, 8) if bin(i ^ j).count("1") == 1]
+COLORS = {"pedestrian": (60, 220, 60), "vehicle": (255, 160, 40), "truck": (40, 140, 255)}
+
+
+def draw_overlay(img, labels):
+    out = img.copy()
+    for lb in labels:
+        col = COLORS[lb["kind"]]
+        pts = lb["corners_2d"]
+        for i, j in EDGES:
+            if pts[i] is not None and pts[j] is not None:
+                cv2.line(out, tuple(map(int, pts[i])), tuple(map(int, pts[j])), col, 1)
+        if lb["bbox_full"]:
+            x0, y0, x1, y1 = lb["bbox_full"]
+            cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 255), 1)
+        x0, y0, x1, y1 = lb["bbox_visible"]
+        cv2.rectangle(out, (x0, y0), (x1, y1), col, 2)
+        text = lb["kind"]
+        if lb["kind"] == "pedestrian":
+            text = f"{lb['meta'].get('type')} {lb['meta'].get('role')} occ {lb['occlusion']:.0%}"
+        cv2.putText(out, text, (x0, max(12, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+    return out
