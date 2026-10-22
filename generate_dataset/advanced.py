@@ -16,42 +16,63 @@ SERVER_WAIT_SECONDS = 1800          # how long to wait for an unreachable server
 # sun 70-90 deg high: always >60 deg above the top of the image, never in frame or blinding
 SUN_ALTITUDE_RANGE = (70.0, 90.0)
 SUN_AZIMUTH_RANGE = (0.0, 360.0)
-WEATHER_LOOK = {                    # (min, max) sampled per image; rain/wetness always 0
-    "clear":         {"cloudiness": (0, 10),   "fog_density": (0, 2),  "wind_intensity": (0, 15)},
-    "partly_cloudy": {"cloudiness": (30, 60),  "fog_density": (0, 3),  "wind_intensity": (5, 30)},
-    "overcast":      {"cloudiness": (85, 100), "fog_density": (2, 8),  "wind_intensity": (10, 40)},
+WEATHER_LOOK = {                    # (min, max) sampled; anything not listed is 0
+    "clear":         {"cloudiness": (0, 10), "fog_density": (0, 2), "wind_intensity": (0, 15)},
+    "partly_cloudy": {"cloudiness": (30, 60), "fog_density": (0, 3), "wind_intensity": (5, 30)},
+    "overcast":      {"cloudiness": (85, 100), "fog_density": (2, 8), "wind_intensity": (10, 40)},
+    "rain":          {"cloudiness": (80, 100), "precipitation": (40, 80), "precipitation_deposits": (30, 70),
+                      "wetness": (50, 90), "fog_density": (3, 10), "wind_intensity": (20, 50)},
+    # CARLA 0.9.16 has no snow assets: this is only a cold, hazy, sleet-like approximation
+    "snowfall":      {"cloudiness": (95, 100), "precipitation": (15, 35), "precipitation_deposits": (40, 70),
+                      "wetness": (20, 40), "fog_density": (20, 35), "fog_distance": (10, 30),
+                      "wind_intensity": (30, 60)},
 }
+WEATHER_RESAMPLE_EVERY = 25         # new sun/cloud values (same weather type) every N jobs; 0 = never
 
 # --- pedestrians ---
 PED_SPEED_RANGE = {"child": (0.7, 1.4), "woman": (0.9, 1.5), "man": (1.0, 1.7)}   # m/s
 PED_RUNNER_PROBABILITY = 0.08
 PED_RUN_SPEED_RANGE = (2.3, 3.2)
 PED_PROGRESS_RANGE = (0.12, 0.88)   # where on the crossing at capture (0 = start curb, 1 = far curb)
-PED_PREROLL_SECONDS = (1.0, 2.0)    # walk this long before capture, so they are mid-stride
+PED_PREROLL_SECONDS = (1.0, 2.0)    # walk this long before the first frame, so they are mid-stride
 PED_MIN_GAP = 0.9
 PED_HEIGHT = {"child": 1.25, "woman": 1.65, "man": 1.78}   # planning estimate only
 SIDEWALK_PED_DISTANCE = (4.0, 25.0)
 SIDEWALK_PED_STANDING_PROBABILITY = 0.3
-PED_TYPE_OVERRIDES = {}             # blueprint id -> "child"/"woman"/"man", if list_blueprints.py shows a wrong type
+PED_TYPE_OVERRIDES = {}             # blueprint id -> "child"/"woman"/"man", if "python main.py --check" shows a wrong type
 PED_BLUEPRINT_EXCLUDE = []
 
+# --- scene types ---
+OCCLUDED_SCENES = ("occluded_by_traffic", "occluded_by_parked")
+SCENE_SITE_KINDS = {                # where each scene type may happen
+    "crosswalk": ["crosswalk"],
+    "jaywalk_road": ["road"],
+    "jaywalk_junction": ["junction"],
+    "occluded_by_traffic": ["crosswalk", "road", "junction"],
+    "occluded_by_parked": ["road", "junction"],     # nobody parks on a marked crosswalk
+}
+
 # --- occlusion ---
-OCCLUSION_LEVELS = {"none": (0.0, 0.10), "partial": (0.10, 0.40), "heavy": (0.40, 0.80)}
-OCCLUSION_TOLERANCE = 0.07          # measured % may miss the level range by this much
-OCCLUDER_TRUCK_PROBABILITY = 0.3    # when the image has a truck, chance the truck is the occluder
-OCCLUDED_EGO_DISTANCE_RANGE = (16.0, 30.0)
-OCCLUDER_MIN_AHEAD = 5.0
-PROTECT_TARGET_MAX_COVER = 0.05     # other traffic may cover at most this much of the target
+OCCLUSION_TOLERANCE = 0.15          # frame is flagged if measured occlusion misses the planned value by more
+OCCLUDER_TRUCK_CHANCE = 0.3         # when trucks are available, chance the occluder is a truck
+OCCLUDED_EGO_DISTANCE_RANGE = (14.0, 30.0)
+ADJACENT_CARS_AHEAD = (1.0, 12.0)   # occluding cars next to the ego: metres ahead of the ego
+PARKED_NOSE_GAP = (0.5, 1.3)        # gap between parked car's front and the pedestrian's path
+SEQUENCE_MAX_SECONDS = 15.0         # longest walk to cover all frames of a sequence
+FULLY_VISIBLE = 0.03                # "completely visible" = at most this much hidden
+PROTECT_TARGET_MAX_COVER = 0.05     # non-occluder traffic may cover at most this much of the target
 
 # --- crossing sites ---
 JAYWALK_MIN_DIST_FROM_CROSSWALK = 30.0
 JAYWALK_SITE_SPACING = 20.0
 JAYWALK_ROAD_WIDTH_RANGE = (5.0, 25.0)
+JUNCTION_ARM_OFFSET = 4.0           # crossing line this far out from a T-junction's edge
+JUNCTION_MIN_DIST_FROM_CROSSWALK = 10.0   # "crosswalk is missing": skip arms that have one
 
 # --- ego / camera ---
 EGO_FALLBACK_BLUEPRINT = "vehicle.lincoln.mkz_2020"
 EGO_DISTANCE_RANGE = (10.0, 30.0)   # ego to crossing centre, metres
-DISTANCE_BIN = 2.0                  # no two images share (site, lane, distance bin, weather, occlusion level)
+DISTANCE_BIN = 2.0                  # no two jobs share (site, lane, distance bin, weather, scene type)
 EGO_YAW_JITTER_DEG = 2.0
 EGO_LATERAL_JITTER = 0.25
 MAX_VIEW_BEARING_DEG = 30.0
@@ -69,60 +90,96 @@ RGB_ATTRIBUTES = {
 }
 CAPTURE_SETTLE_TICKS = 6
 JPEG_QUALITY = 95
+BOX_COLOR = (0, 255, 0)             # drawn box colour, OpenCV B, G, R (green). no text is drawn
+BOX_THICKNESS = 2
+
+# config.SAVE flag -> output folder (labels_3d/ is always written)
+OUTPUT_FOLDERS = {
+    "image": "images", "depth": "depth", "depth_color": "depth_color",
+    "seg_color": "seg_color", "seg_raw": "seg_raw",
+    "bbox_2d_image": "images_2d_bbox", "bbox_3d_image": "images_3d_bbox", "labels_yolo": "labels",
+}
 
 # --- traffic placement ---
 EGO_LANE_WIDTH = 2.4                # same-direction traffic drifts at most (2.4 - width) / 2 off lane centre
 ONCOMING_MAX_DRIFT = 0.3
 CAR_SIZE = (5.0, 2.1, 1.6)          # length, width, height for planning
 TRUCK_SIZE = (10.0, 2.7, 3.6)
-TRAFFIC_FAR_MAX = 35.0
+CYCLIST_SIZE = (2.0, 0.8, 1.8)
+TRAFFIC_FAR_MAX = 45.0
 NEAR_SIDE_PROBABILITY = 0.4
 EGO_CLEARANCE = 8.0
 VEHICLE_GAP = 1.5
 CROSSING_CLEARANCE = 1.0
 
-# --- labels / quality gates ---
-MIN_VISIBLE_PIXELS = {"pedestrian": 80, "vehicle": 250, "truck": 250}
+# --- labels / quality checks ---
+MIN_VISIBLE_PIXELS = {"pedestrian": 80, "vehicle": 250, "truck": 250, "cyclist": 120}
 MIN_BOX_SIZE_PX = 8
 MAX_LABEL_DISTANCE = 80.0
-LABEL_PARKED_VEHICLES = True
+LABEL_PARKED_VEHICLES = True        # the map's own parked cars
 PARKED_VEHICLE_CLASS = {"Car": "vehicle", "Truck": "truck", "Bus": "truck"}
-MIN_MAIN_PED_PIXELS = 400
-MIN_ROAD_FRACTION = 0.12
+MIN_TARGET_PIXELS = 300             # target pedestrian (unoccluded silhouette) must be at least this big
+MIN_ROAD_FRACTION = 0.12            # below this the camera is probably blocked
 SEG_TAGS = {                        # CARLA >= 0.9.14
     "pedestrian": [12],
-    "vehicle": [14, 15, 16],
+    "vehicle": [14, 15, 16],        # car, truck, bus
+    "cyclist": [13, 18, 19],        # rider, motorcycle, bicycle
     "road_like": [1, 2, 10, 24, 25],
 }
 
 # --- run control ---
-MAX_ATTEMPTS_PER_SCENE = 8
-RELOAD_WORLD_EVERY = 400
-MAX_SCENES_PER_PROCESS = 1500
+MAX_RENDERS_PER_JOB = 6             # renders that crash / fail to spawn before a job is skipped
+MAX_PLANS_PER_JOB = 400
+RELOAD_WORLD_EVERY = 300            # jobs
+MAX_JOBS_PER_PROCESS = 1000
 MAX_CRASHES_WITHOUT_PROGRESS = 6
+EXIT_DONE, EXIT_FATAL, EXIT_NO_SERVER, EXIT_RECYCLE = 0, 2, 3, 10   # worker -> supervisor
+EXIT_STOPPED = 130                  # stopped by Ctrl+C: never restarted
+STOP_WAIT_SECONDS = 60              # on Ctrl+C, time the generator gets to empty the CARLA world
+
+COUNT_KEYS = ("pedestrians", "vehicles", "cyclists", "trucks")
 
 
 # ---------- helpers ----------
 
-class _Scene:
-    def __init__(self, values):
-        self.__dict__.update(values)
+def roll(value, rng):
+    """Config value -> number: an int is exact, a (min, max) pair is random."""
+    if isinstance(value, (tuple, list)):
+        return rng.randint(int(value[0]), int(value[1]))
+    return int(value or 0)
 
 
-def settings_for(weather=None):
-    """SCENE with this weather's changes applied, as attributes (s.cars, s.truck_chance, ...)."""
-    values = dict(SCENE)
-    if weather:
-        values.update({k: v for k, v in WEATHERS[weather].items() if k != "share"})
-    return _Scene(values)
+def roll_occlusion(value, rng):
+    """Occlusion % (number or (min, max)) -> fraction 0..1."""
+    if isinstance(value, (tuple, list)):
+        return rng.uniform(value[0], value[1]) / 100.0
+    return float(value or 0) / 100.0
 
 
-def weather_shares():
-    return {w: spec.get("share", 1) for w, spec in WEATHERS.items()}
+def max_of(value):
+    return max(value) if isinstance(value, (tuple, list)) else (value or 0)
+
+
+def enabled_weathers():
+    return [w for w, spec in WEATHERS.items() if spec.get("enabled", True) and spec.get("images", 0) > 0]
+
+
+def enabled_scenes():
+    return [s for s, spec in SCENES.items() if spec.get("enabled", True) and spec.get("share", 0) > 0]
+
+
+def frames_per_job(scene):
+    if scene in OCCLUDED_SCENES and SEQUENCE.get("enabled", True):
+        return max(1, int(SEQUENCE.get("frames", 1)))
+    return 1
+
+
+def can_occlude(row):
+    return max_of(row.get("vehicles")) + max_of(row.get("trucks")) > 0 and max_of(row.get("occlusion")) > 0
 
 
 def class_names():
-    names = ["pedestrian", "vehicle", "truck"]
+    names = ["pedestrian", "vehicle", "truck", "cyclist"]
     if SPLIT_CROSSING_CLASS:
         names = ["crossing_pedestrian"] + names
     return names
@@ -130,24 +187,36 @@ def class_names():
 
 def validate():
     """Raises ValueError on a config mistake, before any image is generated."""
-    def check_range(name, w, rng, lo, hi):
-        if not (isinstance(rng, (tuple, list)) and len(rng) == 2 and lo <= rng[0] <= rng[1] <= hi):
-            raise ValueError(f"{w}: '{name}' must be (min, max) within {lo}..{hi}, got {rng}")
+    def is_count(v, lo, hi):
+        if isinstance(v, (tuple, list)):
+            return len(v) == 2 and lo <= v[0] <= v[1] <= hi
+        return v is None or (isinstance(v, int) and lo <= v <= hi)
 
-    for w, spec in WEATHERS.items():
+    if not enabled_weathers():
+        raise ValueError("no weather is enabled with images > 0")
+    for w in enabled_weathers():
+        row = WEATHERS[w]
         if w not in WEATHER_LOOK:
             raise ValueError(f"weather '{w}' has no look in advanced.WEATHER_LOOK")
-        bad = [k for k in spec if k != "share" and k not in SCENE]
-        if bad:
-            raise ValueError(f"WEATHERS['{w}'] has unknown keys {bad}; allowed: share, {list(SCENE)}")
-        s = settings_for(w)
-        check_range("crossing_pedestrians", w, s.crossing_pedestrians, 1, 3)
-        check_range("sidewalk_pedestrians", w, s.sidewalk_pedestrians, 0, 5)
-        check_range("cars", w, s.cars, 0, 6)
-        if set(s.pedestrian_types) - set(PED_HEIGHT) or not any(v > 0 for v in s.pedestrian_types.values()):
-            raise ValueError(f"{w}: 'pedestrian_types' keys must be child/woman/man")
-        if set(s.occlusion) - set(OCCLUSION_LEVELS) or not any(v > 0 for v in s.occlusion.values()):
-            raise ValueError(f"{w}: 'occlusion' keys must be {list(OCCLUSION_LEVELS)}")
-        occluded = any(v > 0 for k, v in s.occlusion.items() if k != "none")
-        if occluded and s.cars[1] == 0 and s.truck_chance <= 0:
-            raise ValueError(f"{w}: occluded images need a car or truck to hide the pedestrian")
+        unknown = set(row) - {"enabled", "images", "occlusion", *COUNT_KEYS}
+        if unknown:
+            raise ValueError(f"WEATHERS['{w}'] has unknown keys {sorted(unknown)}")
+        if not is_count(row.get("pedestrians"), 1, 8):
+            raise ValueError(f"{w}: 'pedestrians' must be 1..8 or (min, max)")
+        for k in ("vehicles", "cyclists", "trucks"):
+            if not is_count(row.get(k), 0, 8):
+                raise ValueError(f"{w}: '{k}' must be 0..8 or (min, max)")
+        if not is_count(row.get("occlusion"), 0, 100):
+            raise ValueError(f"{w}: 'occlusion' must be 0..100 or (min, max)")
+    unknown = set(SCENES) - set(SCENE_SITE_KINDS)
+    if unknown:
+        raise ValueError(f"unknown scene types {sorted(unknown)}; allowed {list(SCENE_SITE_KINDS)}")
+    if not enabled_scenes():
+        raise ValueError("no scene type is enabled")
+    if set(PEDESTRIAN_MIX) - set(PED_HEIGHT) or not any(v > 0 for v in PEDESTRIAN_MIX.values()):
+        raise ValueError("PEDESTRIAN_MIX keys must be child/woman/man")
+    unknown = set(SAVE) - set(OUTPUT_FOLDERS)
+    if unknown:
+        raise ValueError(f"unknown SAVE flags {sorted(unknown)}")
+    if TRAIN_VAL_TEST and abs(sum(TRAIN_VAL_TEST) - 1.0) > 1e-6:
+        raise ValueError("TRAIN_VAL_TEST must add up to 1")

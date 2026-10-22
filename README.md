@@ -1,180 +1,297 @@
 # CARLA Pedestrian-Crossing Dataset Generator
 
-Generates labeled dashcam images of pedestrians crossing the road in CARLA 0.9.16,
-built for training **pedestrian / occluded-pedestrian / crossing** models.
+Generates labeled dashcam images of pedestrians crossing urban roads in CARLA 0.9.16,
+including pedestrians hidden behind traffic, for training pedestrian / occluded-pedestrian /
+crossing models.
 
-Every image comes with:
-- YOLO 2D boxes (pedestrian full-body or visible-part, plus vehicles and trucks)
-- a JSON label per image with 2D + 3D boxes, true occlusion %, and crossing attributes
-- semantic segmentation: raw CARLA class ids and a CityScapes-coloured copy
-- an optional debug image with all boxes drawn on it
+For every image you get (each output can be switched off):
+
+| Folder | Content |
+|---|---|
+| `images/` | RGB, 1920x1080 |
+| `depth/` | depth, 16-bit PNG, 1 unit = 1 cm |
+| `seg_color/` | semantic segmentation, CityScapes colours |
+| `images_2d_bbox/` | RGB with the 2D boxes drawn: one colour, no text |
+| `images_3d_bbox/` | RGB with the 3D boxes drawn: one colour, no text |
+| `labels/` | YOLO 2D labels |
+| `labels_3d/` | JSON: every 2D + 3D box, occlusion %, camera, the scene plan (always written) |
 
 ## Quick start
 
-```bash
-# 1. start CARLA 0.9.16 and wait until it has loaded
-# 2. in an env with: carla (matching the server), numpy, opencv-python
-cd generate_dataset
-python list_blueprints.py     # once: checks ego car, pedestrian types, car ids, maps
-python main.py --plan-only 50 # optional: plans 50 scenes per map without rendering
-python main.py                # generates the dataset (run it again any time to resume)
-```
+1. Install the Python packages, with `carla` matching your server version:
+   ```bash
+   pip install numpy opencv-python
+   pip install carla==0.9.16
+   ```
+   If pip has no `carla` build for your Python version, install the wheel shipped with
+   CARLA instead: `pip install <CARLA folder>/PythonAPI/carla/dist/carla-0.9.16-<your python>.whl`.
+2. Start CARLA 0.9.16 and wait until the map has loaded.
+3. Run everything from the `generate_dataset` folder:
+   ```bash
+   cd generate_dataset
+   python main.py --check           # once: checks ego car, pedestrian types, car/truck/cyclist ids, maps
+   python main.py --plan-only 5     # optional: plans 5 jobs per weather + scene, renders nothing
+   python main.py                   # generates the dataset into generate_dataset/dataset/
+   python main.py --delete-flagged  # lists problem images; add --yes to delete them
+   python main.py --summary         # refreshes manifest / summary / train-val-test lists
+   ```
 
-`python main.py` is the only command you need. It runs the generator in a child
-process and restarts it automatically if it crashes. This includes native CARLA
-crashes and core dumps that no Python code can catch. Every saved image is final,
-so a crash only loses the image being rendered at that moment. If you set
-`CARLA_EXECUTABLE` in `config.py`, it also starts and restarts the CARLA server itself.
+`python main.py` restarts its own generator process after any crash (including CARLA
+core dumps) and continues where it stopped. Running it again later also resumes. Set
+`CARLA_EXECUTABLE` in `config.py` (e.g. `"/opt/carla/CarlaUE4.sh"`) to let it start / restart
+the CARLA server too.
 
-## What each image contains
+## All commands
 
-| | |
-|---|---|
-| Map | Town10HD (CARLA's downtown city map) only, no map rotation |
-| Weather | clear, partly cloudy or overcast (exact split, each weather's `share`). Daytime, sun 70–90° high, so it is never in frame and never blinds the camera. No rain or wet roads. |
-| Crossing | a real marked crosswalk (75%) or a jaywalk spot on a straight road with sidewalks on both sides (fallback) |
-| Pedestrians crossing | 1–3, a mix of children, women and men, each with its own speed, walking direction and position on the crossing. Some hurry across. |
-| Pedestrians on the sidewalk | 0–2, walking along or standing, **not** crossing. These are negatives so a model learns crossing vs not crossing. |
-| Traffic | 2–3 cars, plus a truck in about 30% of images. Each vehicle independently drives the same way as the ego or oncoming. Same-direction cars stay within a 2.4 m ego-lane band. |
-| Occlusion | one *target* crossing pedestrian per image with an exact occlusion quota: `none` (<10%), `partial` (10–40%), `heavy` (40–80%). Default split 30/35/35. |
+Run every command from the `generate_dataset` folder. Start CARLA first, except for
+`--delete-flagged` and `--summary`, which only read files on disk.
 
-## How an image is made
+### `python main.py`
 
-1. **Plan.** The whole scene is decided as plain data before anything is spawned:
-   ego pose, every pedestrian (type, blueprint, speed, direction, where on the crossing),
-   every vehicle (lane, same/oncoming, distance, colour). For occluded images, a car or
-   truck is placed between the camera and the target pedestrian. Its position is chosen
-   by projecting both into the camera, so it covers the requested amount.
-2. **Check the plan.** It is rejected and re-planned if vehicles overlap each other,
-   the ego, a parked car or the crossing; if the crossing is not in view; if a
-   pedestrian would walk into something; or if the viewpoint (crossing + lane +
-   distance + weather + occlusion level) was already used. **No two images share a
-   viewpoint**, and crossings are used evenly.
-3. **Render.** The ego teleports, the planned actors spawn, pedestrians walk for 1–2 s
-   so they are mid-stride, then RGB (rendered at 2x and downscaled for anti-aliasing)
-   and segmentation are captured from **exactly the same tick**.
-4. **Measure.** Our traffic is moved out of sight and a second segmentation frame is
-   taken. Comparing the two gives each pedestrian's unoccluded silhouette, so you get a
-   true full-body box, a visible box and a real occlusion %.
-5. **Quality gates.** The image is re-planned, never saved, if the target pedestrian is
-   not clearly visible, its measured occlusion misses the requested level, or the
-   camera is blocked.
-6. **Write** all files. The JSON is written last, so it marks the image as finished.
+**Makes the dataset.** This is the main command.
 
-## Output
+1. Connects to CARLA, loads the map from `MAPS`, and removes any leftover cars, people
+   or cameras.
+2. Finds the places where people can cross: marked crosswalks, straight roads, and
+   T-junctions.
+3. Builds the job list: all clear-weather images first (crosswalk, jaywalk, occluded),
+   then the next weather, and so on.
+4. For each job:
+   - **plans** the whole scene first (where the ego, people and cars go, and how fast
+     people walk);
+   - **spawns** it in CARLA, lets people walk, and **captures** image, depth and
+     segmentation;
+   - **measures** the 2D/3D boxes and how much of the pedestrian is hidden;
+   - **saves** all outputs.
+5. Writes `jobs_done.txt` after every job, so nothing is lost.
 
-```
-dataset/
-  images/          Town10HD_Opt_00042.png         1920x1080 RGB
-  labels/          Town10HD_Opt_00042.txt         YOLO, pedestrian box = PED_YOLO_BOX ("full" by default)
-  labels_visible/  Town10HD_Opt_00042.txt         YOLO, pedestrian box = visible part only
-  labels_3d/       Town10HD_Opt_00042.json        everything below + the full scene plan
-  seg_raw/         Town10HD_Opt_00042.png         CARLA semantic class id per pixel
-  seg_color/       Town10HD_Opt_00042.png         CityScapes palette
-  debug/           Town10HD_Opt_00042.jpg         boxes drawn (SAVE_DEBUG_OVERLAY)
-  data.yaml, classes.txt, manifest.csv, summary.txt, run_log.txt, skipped.json
-```
+If CARLA crashes, it restarts by itself and continues. If you stop it (Ctrl+C) and run
+it again later, it **continues** where it stopped.
 
-YOLO classes: `0 pedestrian, 1 vehicle, 2 truck`. With `SPLIT_CROSSING_CLASS = True`
-the classes are `0 crossing_pedestrian, 1 pedestrian, 2 vehicle, 3 truck`. With
-`LABEL_VEHICLES = False` the YOLO files contain pedestrians only.
+### `python main.py --out /data/run1`
 
-Each JSON label has `bbox_visible`, `bbox_full` (pedestrians), `bbox_projected`,
-`occlusion`, `visible_pixels`, `truncated`, 3D `location_world` / `rotation_world` /
-`dimensions`, `location_camera` (x right, y down, z forward), the 8 projected 3D
-corners, plus `camera.K` and `camera.world_to_camera`. Pedestrians also carry `type`
-(child/woman/man), `role` (crossing/sidewalk), `crossing`, `on_road`, `crossing_type`,
-`crossing_progress`, `walking_direction`, `speed` and `target`.
+Same as above, but the dataset goes into `/data/run1` instead of the default `dataset/`
+folder. Pointing it at an existing folder **resumes** that dataset.
 
-`occlusion` counts occlusion by traffic. Something static, like a pole or a parked car,
-in front of a pedestrian reduces `visible_pixels` but is not part of the occlusion %.
+Use a **new** folder after you change settings in `config.py`, such as image counts,
+weathers or scene types.
 
-## Configuration
+### `python main.py --check`
 
-Two files:
-- [generate_dataset/config.py](generate_dataset/config.py) holds the everyday settings
-  (about 50 lines): dataset size, map, server, what is in each image, per-weather
-  changes, vehicle blueprints and which outputs to save.
-- [generate_dataset/advanced.py](generate_dataset/advanced.py) holds fine tuning: camera,
-  weather look, pedestrian speeds, quality gates, placement distances, timing. You
-  normally never edit it.
+**Checks your CARLA setup before a long run.** It generates nothing. It prints:
 
-What is in each image is one table, `SCENE`:
+- whether your ego car (`my_car_xyz`) exists;
+- every pedestrian model and whether it counts as child, woman or man;
+- which car, truck and cyclist models from `config.py` exist on the server
+  (`ok` / `MISSING`);
+- every vehicle model available, in case you want to add some;
+- whether the maps in `MAPS` are installed.
 
-```python
-SCENE = {
-    "crossing_pedestrians": (1, 3),           # (min, max) people crossing the road
-    "sidewalk_pedestrians": (0, 2),           # (min, max) people on the sidewalk, not crossing
-    "pedestrian_types": {"child": 1, "woman": 1.5, "man": 1.5},   # relative mix
-    "cars": (2, 3),
-    "truck_chance": 0.3,
-    "same_direction_chance": 0.5,
-    "crosswalk_chance": 0.75,
-    "occlusion": {"none": 30, "partial": 35, "heavy": 35},
-}
-```
+Run it once, before your first real run.
 
-`python main.py --total 300 --out test_run` is a good first test run.
+### `python main.py --plan-only 5`
 
-### Different settings per weather
+**A quick test that renders nothing.** It loads each map and *plans* 5 jobs for every
+weather + scene type, without spawning anything. It prints:
 
-Each entry in `WEATHERS` has its `share` of the images, plus any `SCENE` values to
-change for that weather. Anything not listed keeps the `SCENE` value. For example,
-"clear: exactly 2 people crossing, nobody on the sidewalk, 3 cars and 1 truck;
-overcast: 3 people, no truck":
+- how many crossing places the map has (crosswalks, mid-block, T-junctions);
+- how many plans succeeded for each weather and scene type;
+- the most common reasons plans were rejected.
+
+Use it to see whether a map gives enough variety, or why some scene type keeps failing.
+
+### `python main.py --delete-flagged`
+
+**Shows the images that failed a quality check.** These images were saved anyway and
+listed in `flagged.csv`. It prints how many there are, grouped by reason, plus the first
+20 with their reason, and **deletes nothing**. The reasons are:
+
+- the target pedestrian is not in view, or too small;
+- the measured occlusion is far from what was planned;
+- the camera looks blocked.
+
+Look at those images in `images_2d_bbox/` before deciding.
+
+- `--reason occlusion`: only show flagged images whose reason contains that text.
+- `--yes`: actually **delete** them, every output of each image (image, depth,
+  segmentation, box images, labels). Their rows move from `flagged.csv` to `deleted.csv`.
+- `--reason "not in view" --yes`: delete only that kind and keep the rest.
+- `--out /data/run1`: work on a different dataset folder.
+
+### `python main.py --summary`
+
+**Rebuilds the overview files** from the images on disk:
+
+- `manifest.csv`: one row per image (weather, scene type, place, counts, occlusion,
+  flagged or not);
+- `summary.txt`: totals per weather, scene type and map, plus flag reasons;
+- `train.txt`, `val.txt`, `test.txt`: lists for training. Images of the same place always
+  go to the same list, so near-identical images can't leak from training into validation.
+  Flagged images are left out.
+
+This runs automatically at the end of a full run. Run it yourself after deleting images,
+to bring the lists up to date.
+
+### `python main.py --cleanup`
+
+**Empties the CARLA world.** It removes every car, person and camera, and switches CARLA
+back to normal mode, so it doesn't stay frozen.
+
+You normally don't need it: Ctrl+C already does this, and every run cleans up first. It's
+for a program killed hard (`kill -9`, a crash, closing the machine) when CARLA is left
+frozen or full of leftover actors.
+
+## Stopping
+
+Stop any time with **Ctrl+C**. **Ctrl+Z**, `kill <pid>` and closing the terminal do the
+same. Normally Ctrl+Z only *pauses* a program, which would leave CARLA frozen with our
+cars and people in it, so here it stops cleanly instead. Before the program exits it:
+
+1. removes the cars and people of the scene being made,
+2. removes the ego vehicle and its three cameras,
+3. switches the CARLA server back to normal (asynchronous) mode, so it does not freeze,
+4. runs a final `--cleanup` pass to make sure nothing of ours is left.
+
+This takes a few seconds (at most 60). Pressing Ctrl+C again during it is ignored, so
+the cleanup always finishes. A CARLA server started by `main.py` (`CARLA_EXECUTABLE`)
+keeps running. Run `python main.py` again to continue from the last finished job; a
+scene stopped halfway is simply made again.
+
+After a hard kill (`kill -9`, power loss) nothing can clean up. Run
+`python main.py --cleanup` once, or just start `python main.py` again: it always
+empties the world first.
+
+## What gets generated
+
+Everything is set in [generate_dataset/config.py](generate_dataset/config.py).
+
+**Weathers** run one after another, in the order listed. The weather is set once per
+block, not per image.
 
 ```python
 WEATHERS = {
-    "clear":         {"share": 1, "crossing_pedestrians": (2, 2), "sidewalk_pedestrians": (0, 0),
-                      "cars": (3, 3), "truck_chance": 1.0},
-    "partly_cloudy": {"share": 1},
-    "overcast":      {"share": 1, "crossing_pedestrians": (3, 3), "truck_chance": 0.0},
+    "clear":         dict(enabled=True, images=1000, pedestrians=1, vehicles=0, cyclists=0, trucks=0, occlusion=0),
+    "partly_cloudy": dict(enabled=True, images=1000, pedestrians=2, vehicles=1, cyclists=1, trucks=1, occlusion=25),
+    "overcast":      dict(enabled=True, images=1000, pedestrians=3, vehicles=2, cyclists=2, trucks=2, occlusion=50),
+    "rain":          dict(enabled=True, images=1000, pedestrians=4, vehicles=3, cyclists=3, trucks=0, occlusion=75),
+    "snowfall":      dict(enabled=True, images=1000, pedestrians=5, vehicles=4, cyclists=0, trucks=0, occlusion=100),
 }
 ```
 
-- Counts are exact. If a requested car or truck cannot be placed, the scene is
-  re-planned rather than saved with fewer.
-- In an occluded image, the occluder is one of that image's cars, or its truck.
-  "3 cars + 1 truck" stays 3 cars + 1 truck.
-- A typo or an impossible value (e.g. 5 crossing pedestrians) stops the run before
-  any image is generated.
+- A number is exact; `(min, max)` picks a random value per image.
+- Counts are always met exactly. A scene that cannot fit them is re-planned.
+- `occlusion` is how much of the *target* pedestrian is hidden in occluded scenes.
+  `0` = this weather has no occluded scenes.
+- All weathers are daytime with the sun 70–90° high, so it is never in frame.
 
-### One map and variety
+**Scene types** inside each weather (`SCENES`, each with an on/off switch and a share):
 
-With a single map, every image comes from Town10HD's own crossings. No two images
-share a viewpoint (crossing + lane + 2 m distance step + weather + occlusion level),
-so run `python main.py --plan-only 200` first. If it reports many
-`viewpoint already used` rejections, set `DISTANCE_BIN = 1.0` in `advanced.py` to double the unique
-viewpoints, or add `Town03_Opt` / `Town05_Opt` (both urban).
+| Scene | What happens |
+|---|---|
+| `crosswalk` | crossing at a marked crosswalk |
+| `jaywalk_road` | crossing mid-block, no crosswalk |
+| `jaywalk_junction` | crossing an arm of a T-junction (3 roads meet) with no crosswalk |
+| `occluded_by_traffic` | 1–2 cars in the lane next to the ego; the pedestrian walks out in front of them |
+| `occluded_by_parked` | a car parked at the curb; the pedestrian steps out from behind it |
 
-## Reliability
+**Occluded scenes are sequences** (`SEQUENCE`). The pedestrian walks slowly (0.6–1.0 m/s)
+and several frames are taken. Their occlusion goes from the weather's value down to
+fully visible: with `frames=5` and 75 %, the frames are about 75, 56, 38, 19 and 0 %
+hidden. With `SEQUENCE.enabled = False`, one frame at the weather's occlusion is taken.
 
-- Ego and cameras are spawned once per map, not once per frame, and the world is fully
-  reloaded every `RELOAD_WORLD_EVERY` images.
-- Parked-vehicle data is read once per map. Reading it every frame leaks server memory
-  and crashes CARLA (Signal 11).
-- At startup, every vehicle, walker and sensor left over from a crashed run is removed.
-  Otherwise orphaned 4K cameras keep rendering and pile up on the server.
-- The worker restarts itself every `MAX_SCENES_PER_PROCESS` images to cap slow leaks.
-- An image slot that fails `MAX_ATTEMPTS_PER_SCENE` renders is recorded in `skipped.json`
-  with the reasons. Delete that file to retry those slots.
+**Traffic** is cars, trucks and cyclists/scooters. Each is randomly the same direction as
+the ego or oncoming. Same-direction traffic stays within a 2.4 m ego-lane band.
 
-## Size and time
+## How one job is made
 
-At 1920x1080 PNG, expect about 4–5 MB per image including segmentation and debug files
-(about 30 GB for 6000). Use `IMAGE_EXT = ".jpg"` or `SAVE_DEBUG_OVERLAY = False` to cut
-that. Expect roughly 3–6 s per image on a good GPU. Run CARLA with `-RenderOffScreen`.
+1. **Plan** the whole scene as data: crossing site, ego pose, occluders, the target
+   pedestrian's walk and frame times, the other pedestrians, and the traffic. Placement
+   uses a camera model to predict how much of the pedestrian is hidden at every step.
+2. **Check the plan**: no overlaps, crossing in view, normal traffic never hides the
+   target, and no viewpoint is ever repeated (site + lane + distance + weather + scene).
+3. **Render**: spawn, let the pedestrians walk, and capture RGB, segmentation and depth
+   from exactly the same tick. Our traffic is then hidden for one tick to see each
+   pedestrian unoccluded.
+4. **Label** from segmentation: the visible box, the full-body box and the **measured**
+   occlusion %.
+5. **Check** each frame. A frame that fails is **saved anyway** and listed in
+   `flagged.csv` with the reason.
+
+## Problem images: flagged, not thrown away
+
+A frame is flagged when:
+- the target pedestrian is not in view, or too small;
+- the measured occlusion misses the planned value by more than 15 %;
+- the camera looks blocked.
+
+1. `python main.py --delete-flagged` lists them with the reasons.
+2. Look at them in `dataset/images_2d_bbox/`.
+3. `python main.py --delete-flagged --yes` deletes them, or add `--reason <text>` to delete only
+   one kind. Every output of each image is removed, and the rows move to `deleted.csv`.
+4. `python main.py --summary` refreshes the manifest, summary and split lists.
+
+Set `KEEP_FLAGGED_IMAGES = False` to drop failing frames instead (a job whose frames all
+fail is re-planned). A job that never produces an image is listed in `skipped.csv`.
+
+## Output files
+
+```
+dataset/
+  images/ depth/ seg_color/ images_2d_bbox/ images_3d_bbox/ labels/ labels_3d/
+  data.yaml  train.txt  val.txt  test.txt     YOLO dataset, split by location
+  manifest.csv  summary.txt                   one row per image / totals
+  jobs_done.txt  flagged.csv  skipped.csv  deleted.csv  run_log.txt
+```
+
+Image names: `<map>_<weather>_<scene>_<job>_<frame>`, e.g.
+`Town10HD_Opt_rain_occluded_by_parked_00012_03.png`.
+
+The box images (`images_2d_bbox/`, `images_3d_bbox/`) draw exactly the objects in the
+YOLO file, in one colour with no text. Set `BOX_COLOR` (OpenCV B, G, R; default green) and
+`BOX_THICKNESS` in `advanced.py`.
+
+YOLO classes: `0 pedestrian, 1 vehicle, 2 truck, 3 cyclist`. `SPLIT_CROSSING_CLASS = True`
+adds `crossing_pedestrian` in front. Pedestrian boxes are full-body by default
+(`PED_YOLO_BOX`). A pedestrian hidden completely is in the JSON but not in YOLO, unless
+`LABEL_FULLY_HIDDEN_PEDESTRIANS = True`.
+
+`train.txt` / `val.txt` / `test.txt` are grouped by location (`TRAIN_VAL_TEST`). All
+frames of a sequence, and every image from the same crossing, land in the same split.
+Without this, near-identical images would leak from train into val.
 
 ## Files
 
-| File | Role |
-|---|---|
-| `config.py` | everyday settings |
-| `advanced.py` | fine tuning + config helpers |
-| `main.py` | supervisor + generator loop, capture, quality gates, writing |
-| `planner.py` | plans and validates a whole scene before spawning |
-| `crosswalk.py` | finds crossing sites: marked crosswalks, jaywalk fallback |
-| `sidewalk.py` | road cross-section: lanes on both sides, sidewalks, waypoint stepping |
-| `spawner.py` | spawns what the plan says, ego/cameras, cleanup |
-| `utils.py` | projection, segmentation-based boxes and occlusion, file writing, drawing |
-| `list_blueprints.py` | checks a live server against the config |
+You normally only edit `config.py` and run `main.py`. The code that does the work is in
+`engine/`, one small file per job. [CODE_GUIDE.md](CODE_GUIDE.md) explains every file
+and function.
+
+```
+generate_dataset/
+  config.py        everyday settings: images, weathers, scene types, counts, outputs
+  advanced.py      fine tuning: weather look, speeds, tolerances, camera, box colour
+  main.py          the only script you run: the list of commands
+  engine/
+    stop.py          clean stop on Ctrl+C / Ctrl+Z / kill
+    supervisor.py    auto-restart after crashes, optional CARLA server start
+    tools.py         --check, --delete-flagged, --cleanup
+    roads.py         lanes, sidewalks, crossing sites (crosswalk, mid-block, T-junction)
+    camera.py        planning-time camera: how much of a pedestrian a vehicle hides
+    people.py        pedestrian planning: who walks where, how fast
+    traffic.py       car / truck / cyclist placement, occluder layouts
+    occlusion.py     occluder + slow walk from hidden to visible
+    planner.py       puts a whole scene plan together and checks it
+    carla_io.py      spawning / removing actors; per-map session, weather, capture
+    render.py        runs one plan in CARLA and captures its frames
+    labels.py        labels from segmentation, quality checks, saving outputs
+    run.py           job list, job loop, progress files, summary
+```
+
+## Known limitations
+
+- **Snow:** CARLA 0.9.16 has no snow. `snowfall` is only a hazy, sleet-like
+  approximation. Disable it or replace it if you have real snow assets.
+- **100 % occlusion** means the pedestrian cannot be seen at all in that frame. It is
+  labeled in the JSON (`visible: false`) but left out of YOLO by default.
+- **Occlusion** counts only occlusion by the traffic we place. A pole or parked map car
+  in front of a pedestrian lowers `visible_pixels` but not the occlusion %.
+- **Static traffic:** vehicles are frozen in place (no motion blur, no driving).
