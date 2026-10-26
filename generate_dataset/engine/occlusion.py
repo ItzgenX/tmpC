@@ -1,26 +1,26 @@
-"""Plans an occluded pedestrian: occluder(s) + a slow walk from hidden to visible.
+"""Plans an occluded pedestrian: occluder(s) + a walk that passes behind them.
+
+Seen from the ego, the target pedestrian is first clearly visible, then walks
+behind the car (hidden), then comes out and is clearly visible again:
+
+    visible  ->  partly hidden  ->  most hidden  ->  partly hidden  ->  visible
 
 1. Put the occluder(s) in place: 1-2 cars next to the ego, or a car parked at the curb.
-2. The target pedestrian walks across from the occluder's side of the road.
-3. Along that walk, predict (camera model) how much of the pedestrian is hidden at
-   every 10 cm, and pick the frames where the hidden share drops through the
-   requested levels: e.g. 75 % -> 56 % -> 38 % -> 19 % -> 0 %.
+2. Along the pedestrian's walk across the road, predict (camera model) how much of
+   them is hidden at every 10 cm.
+3. Find a stretch "visible -> hidden -> visible" whose most hidden point lies in the
+   weather's occlusion range (min, max), and spread the frames over that stretch.
 The real occlusion of every frame is measured later from segmentation.
 """
 import advanced as C
 from engine.camera import coverage, in_view, rects_overlap
 from engine.people import crossing_line, make_ped, ped_box, pick_type
-from engine.traffic import adjacent_occluders, box_of, parked_occluder
+from engine.traffic import adjacent_occluders, boxes_of, parked_occluder
 
 
-STEP = 0.1          # metres between predicted positions
-
-
-def frame_levels(top, n):
-    """n occlusion levels for the frames of one walk, from `top` down to fully visible."""
-    if n == 1:
-        return [top]
-    return [top * (n - 1 - i) / (n - 1) for i in range(n)]
+STEP = 0.1              # metres between predicted positions
+EXTEND = 3.0            # the walk may go this far onto each sidewalk
+CLEAR_VIEW = 0.8        # metres walked fully visible before / after the hidden stretch
 
 
 def _occluder_categories(ctx, scene, cars, trucks):
@@ -40,36 +40,64 @@ def _occluder_categories(ctx, scene, cars, trucks):
 
 
 def _walk(ctx, direction, lateral):
-    """Positions (s, x, y) along the walk, from 1.5 m back on the sidewalk to the far curb."""
+    """Positions (s, x, y) every STEP m along a walk across the road, sidewalk to sidewalk."""
     (ox, oy), d = crossing_line(ctx.site, direction, lateral)
-    out, s = [], -1.5
-    while s <= ctx.site.length:
+    out, s = [], -EXTEND
+    while s <= ctx.site.length + EXTEND:
         out.append((s, ox + d[0] * s, oy + d[1] * s))
         s += STEP
     return out, d
 
 
-def _pick_frames(curve, levels):
-    """Index into curve for each level: first point (after the peak) hidden <= level."""
-    peak = max(range(len(curve)), key=lambda i: curve[i])
-    if curve[peak] <= 0.0:
-        return None             # never hidden at all
-    top = min(levels[0], curve[peak])
-    wanted = [top] + [lv for lv in levels[1:]]
-    idx, start = [], peak
-    for k, lv in enumerate(wanted):
-        limit = C.FULLY_VISIBLE if k == len(wanted) - 1 and len(wanted) > 1 else lv + 1e-9
-        hit = next((i for i in range(start, len(curve)) if 0.0 <= curve[i] <= limit), None)
-        if hit is None:
-            return None
-        idx.append(hit)
-        start = hit + 1
-    return idx
+def _arcs(curve, lo, hi):
+    """Stretches "visible -> hidden -> visible" whose most hidden point is within [lo, hi].
+    curve[i] = hidden share at step i, or -1 if out of the image.
+    Returns (start, peak, end) indices; start / end are CLEAR_VIEW m into the visible parts."""
+    def visible(i):
+        return 0.0 <= curve[i] <= C.FULLY_VISIBLE
+
+    margin = max(1, round(CLEAR_VIEW / STEP))
+    out, i, n = [], 0, len(curve)
+    while i < n:
+        if curve[i] > C.FULLY_VISIBLE:
+            a = i
+            while i < n and curve[i] > C.FULLY_VISIBLE:
+                i += 1
+            b = i - 1                                   # hidden run a..b, all in view
+            if a == 0 or b == n - 1 or not visible(a - 1) or not visible(b + 1):
+                continue
+            peak = max(range(a, b + 1), key=lambda k: curve[k])
+            if not (lo - 0.01 <= curve[peak] <= hi + 0.01):
+                continue
+            start = a - 1
+            while start > 0 and a - start < margin and visible(start - 1):
+                start -= 1
+            end = b + 1
+            while end < n - 1 and end - b < margin and visible(end + 1):
+                end += 1
+            out.append((start, peak, end))
+        else:
+            i += 1
+    return out
 
 
-def plan_occluded(ctx, scene, top, cars, trucks, n_frames):
-    """Returns (target_ped, occluders, frames, rects) for the best layout found, or None."""
-    levels = frame_levels(top, n_frames)
+def _frame_indices(start, peak, end, n):
+    """n frames spread evenly from start to end, one of them exactly at the peak."""
+    if n == 1:
+        return [peak]
+    if n == 2:                                          # too short for the whole arc: visible, then hidden
+        return [start, peak]
+    idx = [round(start + (end - start) * k / (n - 1)) for k in range(n)]
+    nearest = min(range(n), key=lambda k: abs(idx[k] - peak))
+    idx[nearest] = peak
+    return sorted(set(idx))
+
+
+def plan_occluded(ctx, scene, occ_range, cars, trucks, n_frames):
+    """Returns (target_ped, occluders, frames, rects, peak) for the best layout found, or None.
+    occ_range = (min, max) hidden share of the target at its most hidden moment."""
+    lo, hi = occ_range
+    goal = ctx.rng.uniform(lo, hi)
     best = None
     for _ in range(40):
         ptype = pick_type(ctx)
@@ -87,41 +115,35 @@ def plan_occluded(ctx, scene, top, cars, trucks, n_frames):
         if placed is None:
             continue
         occluders, occ_rects = placed
-        boxes = [box_of(ctx, v) for v in occluders]
+        boxes = [b for v in occluders for b in boxes_of(ctx, v)]
 
-        # walk from the side of the road the occluders are on
-        occ_lat = sum(r[1] for r in occ_rects) / len(occ_rects)
-        start_lat = ctx.frame.local(*ctx.site.start[:2])[1]
-        direction = 1 if (start_lat > 0) == (occ_lat > 0) else -1
-        walk, d = _walk(ctx, direction, lateral)
-
+        walk, d = _walk(ctx, ctx.rng.choice((1, -1)), lateral)
         probe = {"ground_z": ctx.site.center[2], "yaw": 0.0, "type": ptype}
         curve = []
         for _, x, y in walk:
             box = ped_box(ctx, probe, x, y)
             curve.append(coverage(box, boxes) if in_view(box) else -1.0)
-        idx = _pick_frames(curve, levels)
-        if idx is None:
-            continue
-        # the target must not walk into its own occluder
-        if any(rects_overlap((*ctx.frame.local(walk[i][1], walk[i][2]), 0.5, 0.5), r, 0.0, 0.0)
-               for i in range(idx[0], idx[-1] + 1) for r in occ_rects):
-            continue
 
-        score = abs(curve[idx[0]] - levels[0])
-        if best is None or score < best[0]:
-            best = (score, ptype, speed, d, walk, idx, curve, occluders, occ_rects, rects + occ_rects)
-        if score < 0.03:
+        for start, peak, end in _arcs(curve, lo, hi):
+            # the target must never walk into its own occluder
+            if any(rects_overlap((*ctx.frame.local(walk[i][1], walk[i][2]), 0.5, 0.5), r, 0.0, 0.0)
+                   for i in range(start, end + 1) for r in occ_rects):
+                continue
+            score = abs(curve[peak] - goal)
+            if best is None or score < best[0]:
+                best = (score, ptype, speed, d, walk, (start, peak, end), curve, occluders, rects + occ_rects)
+        if best is not None and best[0] < 0.03:
             break
 
     if best is None:
         return None
-    _, ptype, speed, d, walk, idx, curve, occluders, occ_rects, rects = best
+    _, ptype, speed, d, walk, (start, peak, end), curve, occluders, rects = best
+    idx = _frame_indices(start, peak, end, n_frames)
 
     # start walking a little before the first frame, so the pedestrian is mid-stride
     preroll = ctx.rng.uniform(*C.PED_PREROLL_SECONDS)
     s0 = walk[idx[0]][0]
-    s_spawn = max(-2.5, s0 - speed * preroll)
+    s_spawn = max(-EXTEND - 0.5, s0 - speed * preroll)
     sx, sy = walk[idx[0]][1] - d[0] * (s0 - s_spawn), walk[idx[0]][2] - d[1] * (s0 - s_spawn)
 
     frames, last_tick = [], -10 ** 9
@@ -131,4 +153,4 @@ def plan_occluded(ctx, scene, top, cars, trucks, n_frames):
         frames.append({"tick": tick, "planned_occlusion": round(max(curve[i], 0.0), 3)})
         last_tick = tick
     target = make_ped(ctx, "crossing", ptype, speed, False, sx, sy, d, walk[idx[0]][1:])
-    return target, occluders, frames, rects
+    return target, occluders, frames, rects, round(curve[peak], 3)

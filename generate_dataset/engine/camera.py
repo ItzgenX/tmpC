@@ -78,12 +78,16 @@ def coverage(target, occluders, samples=12):
     estimated on a samples x samples grid. Only the part of the target inside the image counts."""
     if target is None:
         return 0.0
-    near = [o[0] for o in occluders if o is not None and o[1] < target[1]]
     t = target[0]
     x0, y0 = max(t[0], 0.0), max(t[1], 0.0)
     x1, y1 = min(t[2], float(C.IMAGE_W)), min(t[3], float(C.IMAGE_H))
+    # only nearer occluders whose box actually touches the target's box (fast path: none)
+    near = [o[0] for o in occluders if o is not None and o[1] < target[1]
+            and o[0][0] < x1 and o[0][2] > x0 and o[0][1] < y1 and o[0][3] > y0]
     if x1 <= x0 or y1 <= y0 or not near:
         return 0.0
+    if any(o[0] <= x0 and o[1] <= y0 and o[2] >= x1 and o[3] >= y1 for o in near):
+        return 1.0                                  # one occluder covers it completely
     hidden = 0
     for i in range(samples):
         px = x0 + (i + 0.5) * (x1 - x0) / samples

@@ -23,11 +23,11 @@ WEATHER_LOOK = {                    # (min, max) sampled; anything not listed is
     "rain":          {"cloudiness": (80, 100), "precipitation": (40, 80), "precipitation_deposits": (30, 70),
                       "wetness": (50, 90), "fog_density": (3, 10), "wind_intensity": (20, 50)},
     # CARLA 0.9.16 has no snow assets: this is only a cold, hazy, sleet-like approximation
-    "snowfall":      {"cloudiness": (95, 100), "precipitation": (15, 35), "precipitation_deposits": (40, 70),
-                      "wetness": (20, 40), "fog_density": (20, 35), "fog_distance": (10, 30),
-                      "wind_intensity": (30, 60)},
+    # "snowfall":      {"cloudiness": (95, 100), "precipitation": (15, 35), "precipitation_deposits": (40, 70),
+    #                   "wetness": (20, 40), "fog_density": (20, 35), "fog_distance": (10, 30),
+    #                   "wind_intensity": (30, 60)},
 }
-WEATHER_RESAMPLE_EVERY = 25         # new sun/cloud values (same weather type) every N jobs; 0 = never
+WEATHER_RESAMPLE_EVERY = 5          # new sun/cloud values (same weather type) every N jobs; 0 = never
 
 # --- pedestrians ---
 PED_SPEED_RANGE = {"child": (0.7, 1.4), "woman": (0.9, 1.5), "man": (1.0, 1.7)}   # m/s
@@ -54,26 +54,28 @@ SCENE_SITE_KINDS = {                # where each scene type may happen
 
 # --- occlusion ---
 OCCLUSION_TOLERANCE = 0.15          # frame is flagged if measured occlusion misses the planned value by more
+OCCLUSION_NUMBER_SPREAD = 10.0      # a single occlusion number v in config means the range v-10 .. v+10 %
+LOWEST_REACHABLE_OCCLUSION = 0.5    # behind a car the most hidden moment is rarely below this (warning only)
 OCCLUDER_TRUCK_CHANCE = 0.3         # when trucks are available, chance the occluder is a truck
-OCCLUDED_EGO_DISTANCE_RANGE = (14.0, 30.0)
-ADJACENT_CARS_AHEAD = (1.0, 12.0)   # occluding cars next to the ego: metres ahead of the ego
-PARKED_NOSE_GAP = (0.5, 1.3)        # gap between parked car's front and the pedestrian's path
+OCCLUDED_EGO_DISTANCE_RANGE = (12.0, 35.0)
+ADJACENT_CARS_AHEAD = (1.0, 25.0)   # occluding cars next to the ego: metres ahead of the ego
+PARKED_NOSE_GAP = (0.5, 6.0)        # gap between parked car's front and the pedestrian's path
 SEQUENCE_MAX_SECONDS = 15.0         # longest walk to cover all frames of a sequence
 FULLY_VISIBLE = 0.03                # "completely visible" = at most this much hidden
 PROTECT_TARGET_MAX_COVER = 0.05     # non-occluder traffic may cover at most this much of the target
 
 # --- crossing sites ---
 JAYWALK_MIN_DIST_FROM_CROSSWALK = 30.0
-JAYWALK_SITE_SPACING = 20.0
+JAYWALK_SITE_SPACING = 10.0         # metres between two mid-block crossing spots
 JAYWALK_ROAD_WIDTH_RANGE = (5.0, 25.0)
 JUNCTION_ARM_OFFSET = 4.0           # crossing line this far out from a T-junction's edge
 JUNCTION_MIN_DIST_FROM_CROSSWALK = 10.0   # "crosswalk is missing": skip arms that have one
 
 # --- ego / camera ---
 EGO_FALLBACK_BLUEPRINT = "vehicle.lincoln.mkz_2020"
-EGO_DISTANCE_RANGE = (10.0, 30.0)   # ego to crossing centre, metres
-DISTANCE_BIN = 2.0                  # no two jobs share (site, lane, distance bin, weather, scene type)
-EGO_YAW_JITTER_DEG = 2.0
+EGO_DISTANCE_RANGE = (8.0, 40.0)    # ego to crossing centre, metres
+MIN_VIEW_DISTANCE_GAP = 6.0         # same spot + lane + weather: views must differ by this many metres
+EGO_YAW_JITTER_DEG = 5.0
 EGO_LATERAL_JITTER = 0.25
 MAX_VIEW_BEARING_DEG = 30.0
 EGO_SIZE = (5.0, 2.2)
@@ -82,6 +84,8 @@ RGB_SUPERSAMPLE = 2                 # RGB rendered at 2x then downscaled; 1 = fa
 CAMERA_FOV = 90.0
 CAMERA_LOCATION = (0.8, 0.0, 1.8)   # x forward, y right, z up, relative to ego
 CAMERA_PITCH = -10.0
+CAMERA_LIFT_RANGE = (0.0, 0.4)      # per image: camera this much higher (car .. van), by lifting the ego
+CAMERA_PITCH_JITTER_DEG = 3.0       # per image: camera tilt -10 +/- this
 RGB_ATTRIBUTES = {
     "motion_blur_intensity": 0.0, "lens_flare_intensity": 0.0,
     "exposure_speed_up": 15.0, "exposure_speed_down": 15.0,
@@ -104,6 +108,8 @@ OUTPUT_FOLDERS = {
 EGO_LANE_WIDTH = 2.4                # same-direction traffic drifts at most (2.4 - width) / 2 off lane centre
 ONCOMING_MAX_DRIFT = 0.3
 CAR_SIZE = (5.0, 2.1, 1.6)          # length, width, height for planning
+CAR_BODY_HEIGHT = 0.95              # occlusion estimate: car body height (bonnet / boot) ...
+CAR_CABIN_LENGTH_PART = 0.55        # ... plus a full-height cabin over this middle part of the length
 TRUCK_SIZE = (10.0, 2.7, 3.6)
 CYCLIST_SIZE = (2.0, 0.8, 1.8)
 TRAFFIC_FAR_MAX = 45.0
@@ -122,10 +128,16 @@ MIN_TARGET_PIXELS = 300             # target pedestrian (unoccluded silhouette) 
 MIN_ROAD_FRACTION = 0.12            # below this the camera is probably blocked
 SEG_TAGS = {                        # CARLA >= 0.9.14
     "pedestrian": [12],
-    "vehicle": [14, 15, 16],        # car, truck, bus
-    "cyclist": [13, 18, 19],        # rider, motorcycle, bicycle
+    "vehicle": [14, 15, 16],        # car, truck, bus (used for the ego bonnet mask)
     "road_like": [1, 2, 10, 24, 25],
 }
+# a box's class comes from CARLA's own semantic tag on that object's pixels
+TAG_CLASS = {12: "pedestrian", 14: "vehicle", 15: "truck", 16: "truck",
+             18: "cyclist", 19: "cyclist", 13: "cyclist"}
+TAG_NAMES = {12: "Pedestrian", 13: "Rider", 14: "Car", 15: "Truck", 16: "Bus",
+             18: "Motorcycle", 19: "Bicycle"}
+RIDER_TAG = 13                      # a rider counts with the bicycle / motorcycle it sits on
+DEPTH_MATCH_MARGIN = 0.75           # a pixel belongs to an object if its depth is within the object's box +- this (m)
 
 # --- run control ---
 MAX_RENDERS_PER_JOB = 6             # renders that crash / fail to spawn before a job is skipped
@@ -149,11 +161,13 @@ def roll(value, rng):
     return int(value or 0)
 
 
-def roll_occlusion(value, rng):
-    """Occlusion % (number or (min, max)) -> fraction 0..1."""
+def occlusion_range(value):
+    """Occlusion % from config -> (min, max) as fractions 0..1: the hidden share of the
+    target at its most hidden moment. A single number v means v +- OCCLUSION_NUMBER_SPREAD."""
     if isinstance(value, (tuple, list)):
-        return rng.uniform(value[0], value[1]) / 100.0
-    return float(value or 0) / 100.0
+        return value[0] / 100.0, value[1] / 100.0
+    v = float(value or 0)
+    return max(0.0, v - OCCLUSION_NUMBER_SPREAD) / 100.0, min(100.0, v + OCCLUSION_NUMBER_SPREAD) / 100.0
 
 
 def max_of(value):
@@ -218,5 +232,9 @@ def validate():
     unknown = set(SAVE) - set(OUTPUT_FOLDERS)
     if unknown:
         raise ValueError(f"unknown SAVE flags {sorted(unknown)}")
+    if MAX_USES_PER_SPOT is not None and (not isinstance(MAX_USES_PER_SPOT, int) or MAX_USES_PER_SPOT < 1):
+        raise ValueError("MAX_USES_PER_SPOT must be a whole number >= 1, or None")
+    if not MAPS or not all(isinstance(m, str) and m for m in MAPS):
+        raise ValueError("MAPS must list at least one map name")
     if TRAIN_VAL_TEST and abs(sum(TRAIN_VAL_TEST) - 1.0) > 1e-6:
         raise ValueError("TRAIN_VAL_TEST must add up to 1")

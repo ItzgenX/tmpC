@@ -63,17 +63,14 @@ def decode_depth(img):
 
 
 # ---------- labels ----------
+# The class of every box comes from CARLA's own semantic tags on that object's
+# pixels (advanced.TAG_CLASS), not from which config list a model came from.
+# A pixel only counts for an object if its tag fits AND its depth matches the
+# object's distance, so an object hidden behind a wall can never take the box
+# of another, visible object.
 
 def _group(kind):
-    return {"pedestrian": "pedestrian", "cyclist": "cyclist"}.get(kind, "vehicle")
-
-
-def _tight(mask, box):
-    x0, y0, x1, y1 = box
-    ys, xs = np.nonzero(mask[y0:y1, x0:x1])
-    if len(xs) == 0:
-        return None, None
-    return [int(x0 + xs.min()), int(y0 + ys.min()), int(x0 + xs.max() + 1), int(y0 + ys.max() + 1)], (ys + y0, xs + x0)
+    return "pedestrian" if kind == "pedestrian" else "vehicle"
 
 
 def _search_box(box, w, h, grow=0.08):
@@ -82,19 +79,37 @@ def _search_box(box, w, h, grow=0.08):
     return [int(max(0, x0 - gx)), int(max(0, y0 - gy)), int(min(w, x1 + gx + 1)), int(min(h, y1 + gy + 1))]
 
 
-def _assign_pixels(objs, masks, w, h):
-    """Near-first: each object takes its class pixels inside its projected box that a
-    nearer object has not already taken. Returns {index: (tight_box, pixel_count)}."""
+def _assign_pixels(objs, masks, depth, w, h):
+    """Near-first: each object takes the pixels inside its projected box whose tag fits
+    and whose depth lies within the object's own depth range, unless a nearer object
+    already took them. Returns {index: (tight_box, pixel_count, (ys, xs))}."""
     claimed = np.zeros((h, w), dtype=bool)
     out = {}
     for i, o in sorted(enumerate(objs), key=lambda io: io[1]["depth"]):
-        box, pix = _tight(masks[o["group"]] & ~claimed, _search_box(o["proj_box"], w, h))
-        if box is None:
-            out[i] = (None, 0)
+        x0, y0, x1, y1 = _search_box(o["proj_box"], w, h)
+        ok = masks[o["group"]][y0:y1, x0:x1] & ~claimed[y0:y1, x0:x1]
+        if depth is not None:
+            d = depth[y0:y1, x0:x1]
+            ok &= (d >= o["depth_range"][0]) & (d <= o["depth_range"][1])
+        ys, xs = np.nonzero(ok)
+        if len(xs) == 0:
+            out[i] = (None, 0, None)
             continue
-        claimed[pix] = True
-        out[i] = (box, len(pix[0]))
+        ys, xs = ys + y0, xs + x0
+        claimed[ys, xs] = True
+        out[i] = ([int(xs.min()), int(ys.min()), int(xs.max() + 1), int(ys.max() + 1)], len(xs), (ys, xs))
     return out
+
+
+def _carla_class(seg, pix):
+    """Most common CARLA tag on an object's pixels -> (our class, CARLA class name).
+    A rider counts with the bicycle / motorcycle it sits on."""
+    tags, counts = np.unique(seg[pix], return_counts=True)
+    ranked = [int(t) for _, t in sorted(zip(counts, tags), reverse=True) if int(t) in C.TAG_CLASS]
+    if not ranked:
+        return None, None
+    tag = next((t for t in ranked if t != C.RIDER_TAG), ranked[0])
+    return C.TAG_CLASS[tag], C.TAG_NAMES[tag]
 
 
 def _big_enough(box, pixels, kind):
@@ -102,47 +117,53 @@ def _big_enough(box, pixels, kind):
             and min(box[2] - box[0], box[3] - box[1]) >= C.MIN_BOX_SIZE_PX)
 
 
-def compute_labels(objects, seg, seg_full, hood, world_to_cam, K):
+def compute_labels(objects, seg, seg_full, hood, world_to_cam, K, depth=None, depth_full=None):
     """objects: dicts with kind, source, meta, verts (8,3), center, rotation, extent.
+    seg / depth: the frame as rendered; seg_full / depth_full: our traffic hidden.
     Pedestrians hidden completely are kept (visible = False) when their unoccluded
     silhouette is big enough; vehicles and cyclists need to be visible."""
     h, w = seg.shape
-    tags = C.SEG_TAGS
-    masks = {"pedestrian": np.isin(seg, tags["pedestrian"]),
-             "vehicle": np.isin(seg, tags["vehicle"]) & ~hood,
-             "cyclist": np.isin(seg, tags["cyclist"])}
-    masks_full = dict(masks, pedestrian=np.isin(seg_full, tags["pedestrian"]))
+    masks = {"pedestrian": np.isin(seg, C.SEG_TAGS["pedestrian"]),
+             "vehicle": np.isin(seg, list(C.TAG_CLASS)) & ~np.isin(seg, C.SEG_TAGS["pedestrian"]) & ~hood}
+    masks_full = dict(masks, pedestrian=np.isin(seg_full, C.SEG_TAGS["pedestrian"]))
 
     cand = []
     for o in objects:
-        uv, depth, _ = project(o["verts"], world_to_cam, K)
+        uv, depth_c, _ = project(o["verts"], world_to_cam, K)
         _, c_depth, c_cam = project(np.array([o["center"]]), world_to_cam, K)
-        if c_depth[0] <= 0.5 or c_depth[0] > C.MAX_LABEL_DISTANCE or (depth > 0.1).sum() < 2:
+        front = depth_c > 0.1
+        if c_depth[0] <= 0.5 or c_depth[0] > C.MAX_LABEL_DISTANCE or front.sum() < 2:
             continue
-        front = uv[depth > 0.1]
-        raw = [front[:, 0].min(), front[:, 1].min(), front[:, 0].max(), front[:, 1].max()]
+        pts = uv[front]
+        raw = [pts[:, 0].min(), pts[:, 1].min(), pts[:, 0].max(), pts[:, 1].max()]
         if raw[2] < 0 or raw[3] < 0 or raw[0] > w or raw[1] > h:
             continue
         clipped = [int(max(0, raw[0])), int(max(0, raw[1])), int(min(w, raw[2])), int(min(h, raw[3]))]
         if clipped[2] - clipped[0] < 2 or clipped[3] - clipped[1] < 2:
             continue
         cand.append(dict(o, group=_group(o["kind"]), proj_box=clipped, depth=float(c_depth[0]),
-                         truncated=bool(raw[0] < 0 or raw[1] < 0 or raw[2] > w or raw[3] > h
-                                        or (depth <= 0.1).any()),
+                         depth_range=(float(depth_c[front].min()) - C.DEPTH_MATCH_MARGIN,
+                                      float(depth_c[front].max()) + C.DEPTH_MATCH_MARGIN),
+                         truncated=bool(raw[0] < 0 or raw[1] < 0 or raw[2] > w or raw[3] > h or (~front).any()),
                          corners_2d=[[round(float(x), 1), round(float(y), 1)] if d > 0.1 else None
-                                     for (x, y), d in zip(uv, depth)],
+                                     for (x, y), d in zip(uv, depth_c)],
                          cam_xyz=c_cam[0]))
 
-    visible = _assign_pixels(cand, masks, w, h)
-    full = _assign_pixels(cand, masks_full, w, h)
+    visible = _assign_pixels(cand, masks, depth, w, h)
+    full = _assign_pixels(cand, masks_full, depth_full if depth_full is not None else depth, w, h)
 
     labels = []
     for i, o in enumerate(cand):
-        vis_box, vis_px = visible[i]
-        is_visible = _big_enough(vis_box, vis_px, o["kind"])
+        vis_box, vis_px, pix = visible[i]
+        kind, carla_class = o["kind"], "Pedestrian" if o["kind"] == "pedestrian" else None
+        if kind != "pedestrian" and pix is not None:
+            kind, carla_class = _carla_class(seg, pix)
+            if kind is None:
+                continue
+        is_visible = _big_enough(vis_box, vis_px, kind)
         full_box, full_px, occlusion = None, None, None
-        if o["kind"] == "pedestrian":
-            full_box, full_px = full[i]
+        if kind == "pedestrian":
+            full_box, full_px, _ = full[i]
             if not _big_enough(full_box, full_px, "pedestrian"):
                 continue                # not in view at all, even without traffic
             if vis_box is not None:
@@ -153,7 +174,7 @@ def compute_labels(objects, seg, seg_full, hood, world_to_cam, K):
         elif not is_visible:
             continue
         labels.append({
-            "kind": o["kind"], "source": o["source"], "meta": o["meta"],
+            "kind": kind, "carla_class": carla_class, "source": o["source"], "meta": o["meta"],
             "visible": is_visible,
             "bbox_visible": vis_box if is_visible else None,
             "bbox_full": full_box,
@@ -326,9 +347,12 @@ def _json_default(o):
 
 
 def write_frame(out, name, frame):
-    """frame: dict with rgb, depth_m, seg, seg_color, labels, info (json extras)."""
-    def path(flag, ext):
-        return os.path.join(out, FOLDERS[flag], name + ext)
+    """frame: dict with rgb, depth_m, seg, seg_color, labels, info (json extras).
+    `name` may contain sub-folders (e.g. "rain/crosswalk/00012_00"); they are created."""
+    def path(flag, ext, folder=None):
+        p = os.path.join(out, folder or FOLDERS[flag], name + ext)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        return p
 
     rgb, labels = frame["rgb"], frame["labels"]
     if C.SAVE.get("image"):
@@ -348,6 +372,6 @@ def write_frame(out, name, frame):
         write_image(path("bbox_3d_image", ".jpg"), draw_3d(rgb, labels))
     if C.SAVE.get("labels_yolo"):
         write_text_atomic(path("labels_yolo", ".txt"), "\n".join(yolo_lines(labels)))
-    write_text_atomic(os.path.join(out, "labels_3d", name + ".json"),
+    write_text_atomic(path(None, ".json", folder="labels_3d"),
                       json.dumps({"image": name + C.IMAGE_EXT, **frame["info"], "labels": labels},
                                  indent=1, default=_json_default))

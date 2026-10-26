@@ -156,15 +156,16 @@ def spawn_ego_and_cameras(world, bp_lib, ego_pose):
         raise SpawnError("could not spawn ego vehicle")
     for _ in range(20):         # let it drop onto the road, then freeze it
         world.tick()
-    z_offset = ego.get_location().z - ego_pose["z"]
+    # height of the settled ego above the road, without the per-image camera lift
+    z_offset = ego.get_location().z - (ego_pose["z"] - ego_pose.get("camera_lift", 0.0))
     ego.set_simulate_physics(False)
 
     rgb_bp, seg_bp, depth_bp = camera_blueprints(bp_lib)
     cam_tf = carla.Transform(carla.Location(*C.CAMERA_LOCATION), carla.Rotation(pitch=C.CAMERA_PITCH))
     rgb = world.spawn_actor(rgb_bp, cam_tf, attach_to=ego)
     seg = world.spawn_actor(seg_bp, cam_tf, attach_to=ego)
-    want_depth = C.SAVE.get("depth") or C.SAVE.get("depth_color")
-    depth = world.spawn_actor(depth_bp, cam_tf, attach_to=ego) if want_depth else None
+    # depth is always captured: labels use it to tell which pixels belong to which object
+    depth = world.spawn_actor(depth_bp, cam_tf, attach_to=ego)
     world.tick()
     return ego, rgb, seg, depth, z_offset
 
@@ -241,10 +242,11 @@ def start_walking(walkers, plan_peds):
 # the weather, and frame-exact capture.
 
 class MapSession:
-    def __init__(self, client, carla_module, map_name):
+    def __init__(self, client, carla_module, map_name, map_path=None):
         self.client = client
         self.carla = carla_module
-        self.map_name = map_name
+        self.map_name = map_name                # short name, also the output folder
+        self.map_path = map_path or map_name    # what load_world() is given
         self.world = None
         self.ego = self.rgb = self.seg = self.depth = None
         self.weather_key = None
@@ -264,7 +266,7 @@ class MapSession:
             print(f"  loading {self.map_name}")
             self.client.set_timeout(C.MAP_LOAD_TIMEOUT)
             try:
-                self.world = self.client.reload_world(False) if reload else self.client.load_world(self.map_name)
+                self.world = self.client.reload_world(False) if reload else self.client.load_world(self.map_path)
             finally:
                 self.client.set_timeout(C.CARLA_TIMEOUT)
         self._set_sync(True)
@@ -375,7 +377,7 @@ class MapSession:
     # ---------- capture ----------
 
     def cameras(self):
-        return [self.rgb, self.seg] + ([self.depth] if self.depth is not None else [])
+        return [self.rgb, self.seg, self.depth]
 
     def capture(self, cams, settle_ticks):
         """Listen, tick, and return the images from exactly the last tick."""

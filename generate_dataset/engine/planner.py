@@ -37,26 +37,38 @@ class ScenePlanner:
         self.walker_pools = walker_pools      # {"child": [bp_id], ...}
         self.blueprints = blueprints          # {"car": {bp_id: [colors]}, "truck": ..., "cyclist": ...}
         self.ego_z_offset = 0.0               # set once the ego has settled on this map
-        self.usage = {s.id: 0 for s in sites}
-        self.used_signatures = set()
+        self.usage = {}                       # (site id, weather) -> jobs made there
+        self.views = {}                       # (site id, weather) -> [(lane, distance), ...]
         self._xs_cache = {}
 
     def register(self, plan):
-        """Count a saved job so later plans spread across sites and never repeat a view."""
-        self.usage[plan["site"]["id"]] = self.usage.get(plan["site"]["id"], 0) + 1
-        self.used_signatures.add(plan["signature"])
+        """Count a saved job: spreads jobs over all spots, and blocks near-identical views."""
+        key = (plan["site"]["id"], plan["weather"])
+        self.usage[key] = self.usage.get(key, 0) + 1
+        self.views.setdefault(key, []).append((plan["ego"]["lane"], plan["ego"]["distance"]))
+
+    def _view_is_new(self, site, weather, ego):
+        """At the same spot (same weather), the same lane needs MIN_VIEW_DISTANCE_GAP more or
+        less distance to count as a different picture. Another lane / direction always does."""
+        return all(lane != ego["lane"] or abs(dist - ego["distance"]) >= C.MIN_VIEW_DISTANCE_GAP
+                   for lane, dist in self.views.get((site.id, weather), []))
 
     # ---------- site / ego ----------
 
     def sites_of(self, kinds):
         return [s for s in self.sites if s.kind in kinds]
 
-    def _pick_site(self, rng, kinds):
+    def _pick_site(self, rng, kinds, weather):
+        """A random spot among the least used ones (in this weather), never over MAX_USES_PER_SPOT."""
         pool = self.sites_of(kinds)
         if not pool:
             raise PlanError(f"no {'/'.join(kinds)} sites on this map")
-        least = min(self.usage[s.id] for s in pool)
-        return rng.choice([s for s in pool if self.usage[s.id] <= least + 1])
+        if C.MAX_USES_PER_SPOT:
+            pool = [s for s in pool if self.usage.get((s.id, weather), 0) < C.MAX_USES_PER_SPOT]
+            if not pool:
+                raise PlanError(f"every {'/'.join(kinds)} spot already used {C.MAX_USES_PER_SPOT}x in {weather}")
+        least = min(self.usage.get((s.id, weather), 0) for s in pool)
+        return rng.choice([s for s in pool if self.usage.get((s.id, weather), 0) == least])
 
     def cross_section(self, site):
         if site.id not in self._xs_cache:
@@ -100,6 +112,10 @@ class ScenePlanner:
         lat_j = rng.uniform(-C.EGO_LATERAL_JITTER, C.EGO_LATERAL_JITTER)
         ex, ey = t.location.x + r[0] * lat_j, t.location.y + r[1] * lat_j
         yaw = t.rotation.yaw + rng.uniform(-C.EGO_YAW_JITTER_DEG, C.EGO_YAW_JITTER_DEG)
+        # camera height / tilt vary per image: the camera is fixed to the ego, so the
+        # (physics-free) ego is lifted a little and tilted; the bonnet stays in the same place
+        lift = rng.uniform(*C.CAMERA_LIFT_RANGE)
+        tilt = rng.uniform(-C.CAMERA_PITCH_JITTER_DEG, C.CAMERA_PITCH_JITTER_DEG)
 
         # crossing must be ahead, roughly centred and at the planned distance
         to_c = sub(site.center[:2], (ex, ey))
@@ -109,8 +125,8 @@ class ScenePlanner:
         if not (distance_range[0] - 3 <= dist <= distance_range[1] + 5):
             raise PlanError("ego distance off after road curvature")
 
-        ego = {"x": ex, "y": ey, "z": t.location.z, "yaw": yaw,
-               "pitch": t.rotation.pitch, "roll": t.rotation.roll,
+        ego = {"x": ex, "y": ey, "z": t.location.z + lift, "yaw": yaw,
+               "pitch": t.rotation.pitch + tilt, "roll": t.rotation.roll, "camera_lift": round(lift, 3),
                "lane": lane_key(lane), "distance": round(dist, 2), "approach": group}
         return ego, xs, group
 
@@ -122,20 +138,20 @@ class ScenePlanner:
         occluded = scene in C.OCCLUDED_SCENES
         counts = {k: C.roll(params.get(k), rng) for k in C.COUNT_KEYS}
         requested = dict(counts)
-        top = C.roll_occlusion(params.get("occlusion"), rng) if occluded else 0.0
+        occ_range = C.occlusion_range(params.get("occlusion")) if occluded else (0.0, 0.0)
+        peak = 0.0
         for cat, key in CATEGORY_KEY.items():
             if counts[key] and not self.blueprints[cat]:
                 raise PlanError(f"no {cat} blueprints on this server")
         if not any(self.walker_pools.values()):
             raise PlanError("no pedestrian blueprints")
 
-        site = self._pick_site(rng, C.SCENE_SITE_KINDS[scene])
+        site = self._pick_site(rng, C.SCENE_SITE_KINDS[scene], job["weather"])
         ego, xs, ego_group = self.plan_ego(
             rng, site, C.OCCLUDED_EGO_DISTANCE_RANGE if occluded else C.EGO_DISTANCE_RANGE)
-        signature = (f"{site.id}|{ego['lane']}|{int(ego['distance'] // C.DISTANCE_BIN)}"
-                     f"|{job['weather']}|{scene}")
-        if signature in self.used_signatures:
-            raise PlanError("viewpoint already used")
+        if not self._view_is_new(site, job["weather"], ego):
+            raise PlanError("too close to a view already used at this spot")
+        signature = f"{site.id}|{ego['lane']}|{ego['distance']:.1f}|{job['weather']}|{scene}"
 
         # road-aligned frame (not the jittered ego heading), pointing the way the ego drives
         road_yaw = math.degrees(math.atan2(site.along[1], site.along[0]))
@@ -157,10 +173,11 @@ class ScenePlanner:
         if occluded:
             if counts["vehicles"] + counts["trucks"] == 0:
                 raise PlanError("occluded scene needs a car or truck")
-            result = plan_occluded(ctx, scene, top, counts["vehicles"], counts["trucks"], job["frames"])
+            result = plan_occluded(ctx, scene, occ_range, counts["vehicles"], counts["trucks"], job["frames"])
             if result is None:
-                raise PlanError("no occluder layout reaches the occlusion level")
-            target, vehicles, frames, ctx.rects = result
+                raise PlanError("no layout where the pedestrian walks behind the car (visible -> hidden "
+                                "-> visible) within the occlusion range")
+            target, vehicles, frames, ctx.rects, peak = result
             for v in vehicles:
                 counts[CATEGORY_KEY[v["category"]]] -= 1
             total_s = frames[-1]["tick"] * C.FIXED_DELTA_SECONDS
@@ -202,7 +219,7 @@ class ScenePlanner:
 
         return {
             "job": job["name"], "scene": scene, "weather": job["weather"], "signature": signature,
-            "counts": requested, "occlusion_target": round(top, 3),
+            "counts": requested, "occlusion_range": [round(v, 3) for v in occ_range], "occlusion_peak": peak,
             "site": site.to_json(), "ego": ego,
             "target_pedestrian": target_index, "frames": frames,
             "pedestrians": peds, "vehicles": vehicles,

@@ -2,7 +2,10 @@
 
 # --- run ---
 OUTPUT_DIR = "dataset"              # run again with the same folder to resume
-MAPS = ["Town10HD_Opt"]             # urban downtown. other urban maps: "Town03_Opt", "Town05_Opt"
+# any map the server has, by short name ("Town03_Opt", "MyCity") or full path
+# ("/Game/Custom/Maps/MyCity"); "python main.py --check" lists them. images are
+# split evenly across the maps; custom maps work the same way.
+MAPS = ["Town10HD_Opt", "Town03_Opt", "Town05_Opt"]
 SEED = 2026                         # same seed + same settings = same dataset
 
 # --- CARLA server ---
@@ -14,15 +17,18 @@ CARLA_EXECUTABLE = ""               # optional, e.g. "/opt/carla/CarlaUE4.sh": l
 # pedestrians           : people crossing the road
 # vehicles / trucks     : cars / trucks (occluding cars count as vehicles)
 # cyclists              : cyclists and scooters
-# occlusion             : % of the target pedestrian hidden in occluded scenes (0 = no occluded scenes)
-# a number is exact; (min, max) picks a random value per image
+# occlusion             : (min, max) % of the target pedestrian hidden at its most hidden moment,
+#                         while it walks behind a car (0 = no occluded scenes for this weather).
+#                         Behind a car this moment is naturally 50-100 % hidden (a parked car:
+#                         70-100 %); lower levels are in the frames before / after it.
+# counts: a number is exact; (min, max) picks a random value per image
 WEATHERS = {
     "clear":         dict(enabled=True, images=1000, pedestrians=1, vehicles=0, cyclists=0, trucks=0, occlusion=0),
-    "partly_cloudy": dict(enabled=True, images=1000, pedestrians=2, vehicles=1, cyclists=1, trucks=1, occlusion=25),
-    "overcast":      dict(enabled=True, images=1000, pedestrians=3, vehicles=2, cyclists=2, trucks=2, occlusion=50),
-    "rain":          dict(enabled=True, images=1000, pedestrians=4, vehicles=3, cyclists=3, trucks=0, occlusion=75),
+    "partly_cloudy": dict(enabled=True, images=1000, pedestrians=2, vehicles=1, cyclists=1, trucks=1, occlusion=(50, 75)),
+    "overcast":      dict(enabled=True, images=1000, pedestrians=3, vehicles=2, cyclists=2, trucks=2, occlusion=(60, 85)),
+    "rain":          dict(enabled=True, images=1000, pedestrians=4, vehicles=3, cyclists=3, trucks=0, occlusion=(70, 95)),
     # CARLA 0.9.16 has no real snow - this weather is only a hazy approximation (see advanced.WEATHER_LOOK)
-    # "snowfall":      dict(enabled=True, images=1000, pedestrians=5, vehicles=4, cyclists=0, trucks=0, occlusion=100),
+    # "snowfall":      dict(enabled=True, images=1000, pedestrians=5, vehicles=4, cyclists=0, trucks=0, occlusion=(85, 100)),
 }
 
 # --- scene types made inside each weather (share = relative part of that weather's images) ---
@@ -30,16 +36,19 @@ SCENES = {
     "crosswalk":           dict(enabled=True, share=1),   # crossing at a marked crosswalk
     "jaywalk_road":        dict(enabled=True, share=1),   # crossing mid-block, no crosswalk
     "jaywalk_junction":    dict(enabled=True, share=1),   # crossing where 3 roads meet, no crosswalk
-    "occluded_by_traffic": dict(enabled=True, share=1),   # 1-2 cars next to the ego hide the pedestrian
-    "occluded_by_parked":  dict(enabled=True, share=1),   # pedestrian steps out from behind a parked car
+    "occluded_by_traffic": dict(enabled=True, share=1),   # pedestrian walks behind 1-2 cars next to the ego
+    "occluded_by_parked":  dict(enabled=True, share=1),   # pedestrian walks behind a car parked at the curb
 }
 
-# --- occluded pedestrians: a slow walk from hidden to fully visible ---
+# --- occluded pedestrians: seen from the ego, they walk behind the car and out again ---
 SEQUENCE = dict(
     enabled=True,
-    frames=5,                       # images per walk: weather's occlusion % ... 0 % (fully visible)
+    frames=5,                       # images per walk: visible -> hidden -> visible again
     walk_speed=(0.6, 1.0),          # m/s, slow so the reveal is gradual
 )
+
+# --- variety ---
+MAX_USES_PER_SPOT = 8               # one crossing spot is used at most this often per weather; None = no limit
 
 # --- people and traffic ---
 PEDESTRIAN_MIX = {"child": 1, "woman": 1.5, "man": 1.5}   # relative mix of crossing people
@@ -82,7 +91,11 @@ LABEL_VEHICLES = True               # False = YOLO files contain pedestrians onl
 LABEL_FULLY_HIDDEN_PEDESTRIANS = False   # YOLO box for a pedestrian that cannot be seen at all
 SPLIT_CROSSING_CLASS = False        # True = crossing people get their own YOLO class
 IMAGE_EXT = ".png"                  # RGB image format: ".png" (lossless) or ".jpg" (smaller)
+SAVE_IN_FOLDERS = True              # True = images/clear/crosswalk/clear_crosswalk_00012_00.png
+                                    # False = all in one folder: images/clear_crosswalk_00012_00.png
 
 # --- problem images ---
-KEEP_FLAGGED_IMAGES = True          # save images that fail a check and list them in flagged.csv
+# False: images that fail a check are saved anyway and listed in flagged.csv (review them,
+#        then python main.py --delete-flagged). True: they are skipped, never saved.
+SKIP_FLAGGED_IMAGES = False
 TRAIN_VAL_TEST = (0.8, 0.1, 0.1)    # split lists, grouped by location so no place is in two splits; None = off

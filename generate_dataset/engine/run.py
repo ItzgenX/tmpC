@@ -75,7 +75,7 @@ def _split_of(map_name, site_id):
 
 def write_summary(out):
     rows = []
-    for path in sorted(glob.glob(os.path.join(out, "labels_3d", "*.json"))):
+    for path in sorted(glob.glob(os.path.join(out, "labels_3d", "**", "*.json"), recursive=True)):
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
         plan, labels = d["plan"], d["labels"]
@@ -172,8 +172,45 @@ def scenes_for(weather, available_kinds):
     return out
 
 
+def resolve_maps(wanted, available):
+    """MAPS entries -> ([(short name, path to load)], [entries not on the server]).
+    An entry can be a short name ("Town03_Opt", "MyCity") or a full path
+    ("/Game/Custom/Maps/MyCity"); short names match case-insensitively."""
+    by_name = {}
+    for path in available:
+        by_name.setdefault(path.split("/")[-1].lower(), path)
+    found, missing = [], []
+    for entry in wanted:
+        path = entry if entry in available else by_name.get(entry.split("/")[-1].lower())
+        if path is None:
+            missing.append(entry)
+        elif path not in [p for _, p in found]:
+            found.append((path.split("/")[-1], path))
+    return found, missing
+
+
+def spot_shortages(planner, jobs):
+    """(weather/scene, jobs, spots) where a scene asks for more jobs than its spots allow."""
+    if not C.MAX_USES_PER_SPOT:
+        return []
+    need = collections.Counter((j["weather"], j["scene"]) for j in jobs)
+    out = []
+    for (weather, scene), n in need.items():
+        spots = len(planner.sites_of(C.SCENE_SITE_KINDS[scene]))
+        if n > spots * C.MAX_USES_PER_SPOT:
+            out.append((f"{weather}/{scene}", n, spots))
+    return out
+
+
 def build_jobs(map_name, map_index, n_maps, available_kinds):
-    """The full, ordered job list for one map: weather blocks, scene types inside each."""
+    """The full, ordered job list for one map: weather blocks, scene types inside each.
+
+    A job's name is also where its files go, e.g. "rain/occluded_by_parked/rain_occluded_by_parked_00012"
+    -> images/rain/occluded_by_parked/rain_occluded_by_parked_00012_00.png. The file name
+    alone is unique in the whole dataset; SAVE_IN_FOLDERS = False drops the folders.
+    The map is added (folder and name) only when more than one map is used.
+    """
+    folder = [map_name] if n_maps > 1 else []
     jobs = []
     for weather in C.enabled_weathers():
         n = split_evenly(C.WEATHERS[weather]["images"], n_maps)[map_index]
@@ -185,7 +222,11 @@ def build_jobs(map_name, map_index, n_maps, available_kinds):
             left, j, size = per_scene[scene], 0, C.frames_per_job(scene)
             while left > 0:
                 frames = min(size, left)
-                jobs.append({"name": f"{map_name}_{weather}_{scene}_{j:05d}", "map": map_name,
+                parts = folder + [weather, scene]
+                name = "_".join(parts + [f"{j:05d}"])
+                if C.SAVE_IN_FOLDERS:
+                    name = "/".join(parts + [name])
+                jobs.append({"name": name, "map": map_name,
                              "weather": weather, "scene": scene, "frames": frames})
                 left -= frames
                 j += 1
@@ -232,18 +273,22 @@ class Generator:
             raise ConnectionLost(exc)
         self.write_dataset_yaml()
 
-        available = {m.split("/")[-1] for m in self.client.get_available_maps()}
-        maps = [m for m in C.MAPS if m in available] if C.MAPS else \
-            [self.client.get_world().get_map().name.split("/")[-1]]
-        for m in C.MAPS:
-            if m not in available:
-                print(f"  warning: map {m} is not installed on this server, skipped")
+        for w in C.enabled_weathers():
+            lo, hi = C.occlusion_range(C.WEATHERS[w].get("occlusion"))
+            if 0 < hi < C.LOWEST_REACHABLE_OCCLUSION:
+                print(f"  warning: {w} occlusion range {C.WEATHERS[w]['occlusion']} is below what a car "
+                      f"normally hides ({C.LOWEST_REACHABLE_OCCLUSION:.0%}+ at the most hidden moment); "
+                      f"most occluded jobs will be skipped. use e.g. (50, 75)")
+        maps, missing = resolve_maps(C.MAPS, self.client.get_available_maps())
+        for m in missing:
+            print(f"  warning: map {m} is not on this server (see python main.py --check), skipped")
         if not maps:
+            print("none of the maps in MAPS is on this server")
             return EXIT_FATAL
 
         processed, usable_maps = 0, 0
-        for map_index, map_name in enumerate(maps):
-            session = MapSession(self.client, carla, map_name)
+        for map_index, (map_name, map_path) in enumerate(maps):
+            session = MapSession(self.client, carla, map_name, map_path)
             try:
                 try:
                     session.open()
@@ -261,6 +306,10 @@ class Generator:
                 jobs = build_jobs(map_name, map_index, len(maps), kinds)
                 if jobs:
                     usable_maps += 1
+                for what, n, spots in spot_shortages(session.planner, jobs):
+                    print(f"  not enough spots on {map_name}: {what} needs {n} jobs, but {spots} spots x "
+                          f"{C.MAX_USES_PER_SPOT} uses = {spots * C.MAX_USES_PER_SPOT}. the rest is skipped "
+                          f"(skipped.csv); raise MAX_USES_PER_SPOT, add maps, or lower images")
                 block = collections.Counter()
                 for job in jobs:                # place of each job inside its weather block
                     job["block_index"] = block[job["weather"]]
@@ -340,7 +389,7 @@ class Generator:
                     break
                 continue
 
-            if not C.KEEP_FLAGGED_IMAGES and all(f["flags"] for f in frames):
+            if C.SKIP_FLAGGED_IMAGES and all(f["flags"] for f in frames):
                 reasons["all frames failed checks"] += 1
                 if renders >= C.MAX_RENDERS_PER_JOB:
                     break
@@ -358,7 +407,8 @@ class Generator:
     def _save(self, job, frames):
         saved = 0
         for k, frame in enumerate(frames):
-            if frame["flags"] and not C.KEEP_FLAGGED_IMAGES:
+            if frame["flags"] and C.SKIP_FLAGGED_IMAGES:
+                self.log(f"{job['name']}_{k:02d} not saved: {'; '.join(frame['flags'])}")
                 continue
             name = f"{job['name']}_{k:02d}"
             write_frame(self.out, name, frame)
@@ -368,7 +418,8 @@ class Generator:
                 self.progress.flag(name + C.IMAGE_EXT, job["weather"], job["scene"], frame["flags"],
                                    info["planned_occlusion"], info["measured_occlusion"])
         flagged = sum(1 for f in frames if f["flags"])
-        note = f", {flagged} flagged" if flagged else ""
+        note = (f", {flagged} {'skipped (failed a check)' if C.SKIP_FLAGGED_IMAGES else 'flagged'}"
+                if flagged else "")
         print(f"  {job['name']}: {saved} image(s){note}")
 
     # ---------- dry run ----------

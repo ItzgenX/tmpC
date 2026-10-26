@@ -45,22 +45,23 @@ def render_job(session, plan):
             objects = scene_objects(session, plan, walkers, vehicles, cam_tf)
 
             saved = hide(vehicles)
-            _, (seg_full_img,) = session.capture([session.seg], 1)
+            _, full_imgs = session.capture([session.seg, session.depth], 1)
             restore(vehicles, saved)
             tick += 1
 
-            frames.append(_finish_frame(session, plan, planned, imgs, seg_full_img, objects, cam_tf, world_to_cam))
+            frames.append(_finish_frame(session, plan, planned, imgs, full_imgs, objects, cam_tf, world_to_cam))
         return frames
     finally:
         with protected():           # Ctrl+C during a scene: its actors still get removed
             destroy_actors(session.client, world, actors)
 
 
-def _finish_frame(session, plan, planned, imgs, seg_full_img, objects, cam_tf, world_to_cam):
-    rgb_img, seg_img = imgs[0], imgs[1]
-    depth_img = imgs[2] if len(imgs) > 2 else None
+def _finish_frame(session, plan, planned, imgs, full_imgs, objects, cam_tf, world_to_cam):
+    rgb_img, seg_img, depth_img = imgs
     seg = seg_tags(seg_img)
-    labels = compute_labels(objects, seg, seg_tags(seg_full_img), session.hood, world_to_cam, intrinsics())
+    depth_m = decode_depth(depth_img)
+    labels = compute_labels(objects, seg, seg_tags(full_imgs[0]), session.hood, world_to_cam, intrinsics(),
+                            depth=depth_m, depth_full=decode_depth(full_imgs[1]))
     flags = frame_flags(labels, seg, session.hood, planned["planned_occlusion"])
     target = target_label(labels)
 
@@ -75,7 +76,7 @@ def _finish_frame(session, plan, planned, imgs, seg_full_img, objects, cam_tf, w
         "rgb": np.ascontiguousarray(rgb),
         "seg": seg,
         "seg_color": np.ascontiguousarray(seg_color),
-        "depth_m": decode_depth(depth_img) if depth_img is not None else None,
+        "depth_m": depth_m,
         "labels": labels,
         "flags": flags,
         "info": {

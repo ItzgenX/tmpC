@@ -39,9 +39,16 @@ def vehicle_dict(ctx, category, wp, x, y, direction, role):
     }
 
 
-def box_of(ctx, v):
+def boxes_of(ctx, v):
+    """On-screen boxes of a vehicle's silhouette, for occlusion estimates. A car is a low
+    body over its full length plus a cabin over the middle part (not one tall block,
+    which would hide far too much); a truck or cyclist is one block."""
     length, width, height = SIZE[v["category"]]
-    return ctx.cam.box(box_corners(v["x"], v["y"], v["z"], v["yaw"], length, width, height))
+    if v["category"] != "car":
+        return [ctx.cam.box(box_corners(v["x"], v["y"], v["z"], v["yaw"], length, width, height))]
+    body_h, cabin_part = C.CAR_BODY_HEIGHT, C.CAR_CABIN_LENGTH_PART
+    return [ctx.cam.box(box_corners(v["x"], v["y"], v["z"], v["yaw"], length, width, body_h)),
+            ctx.cam.box(box_corners(v["x"], v["y"], v["z"], v["yaw"], length * cabin_part, width * 0.9, height))]
 
 
 def rect_of(ctx, v):
@@ -109,8 +116,8 @@ def place_traffic(ctx, category, protect_boxes):
         rect = rect_of(ctx, v)
         if any(rects_overlap(rect, r, C.VEHICLE_GAP, 0.3) for r in ctx.rects):
             continue
-        box = box_of(ctx, v)
-        if any(coverage(p, [box]) > C.PROTECT_TARGET_MAX_COVER for p in protect_boxes):
+        boxes = boxes_of(ctx, v)
+        if any(coverage(p, boxes) > C.PROTECT_TARGET_MAX_COVER for p in protect_boxes):
             continue
         ctx.rects.append(rect)
         return v

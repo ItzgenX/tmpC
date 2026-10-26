@@ -53,11 +53,15 @@ def check_server():
         print(f"  {bp.id:40s} {wheels}  {base}")
     print()
 
-    available = {m.split("/")[-1] for m in client.get_available_maps()}
-    print("maps:")
-    for m in C.MAPS or [world.get_map().name.split("/")[-1]]:
-        print(f"  {m:20s} {'ok' if m in available else 'MISSING'}")
-    print("  installed: " + ", ".join(sorted(available)))
+    from engine.run import resolve_maps
+    available = client.get_available_maps()
+    found, missing = resolve_maps(C.MAPS, available)
+    print("maps in config.MAPS:")
+    for name, path in found:
+        print(f"  {name:20s} ok      ({path})")
+    for m in missing:
+        print(f"  {m:20s} MISSING")
+    print("  on this server: " + ", ".join(sorted(p.split("/")[-1] for p in available)))
     return 0
 
 
@@ -107,6 +111,11 @@ def delete_flagged(out, reason, yes):
         for p in _files_of(out, os.path.splitext(r["image"])[0]):
             os.remove(p)
             removed += 1
+            # drop weather / scene folders that are now empty, but never images/, labels/, ...
+            d, root = os.path.normpath(os.path.dirname(p)), os.path.normpath(out)
+            while os.path.dirname(d) != root and d != root and not os.listdir(d):
+                os.rmdir(d)
+                d = os.path.dirname(d)
     deleted_path = os.path.join(out, "deleted.csv")
     new = not os.path.exists(deleted_path)
     with open(deleted_path, "a", newline="", encoding="utf-8") as f:

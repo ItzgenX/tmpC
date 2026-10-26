@@ -165,23 +165,46 @@ empties the world first.
 
 Everything is set in [generate_dataset/config.py](generate_dataset/config.py).
 
+**Maps**: `MAPS` lists the maps to use; images are split evenly across them. Any map
+the server has works, including your own custom maps: give its short name
+(`"Town03_Opt"`, `"MyCity"`) or full path (`"/Game/Custom/Maps/MyCity"`).
+`python main.py --check` shows which maps the server has. A map without crosswalks or
+sidewalks simply gets the scene types it can support, and the run says which it skipped.
+
+**Variety**: no two images look the same.
+
+- **Spots used evenly**: a crossing spot is reused only after all spots have been used
+  equally often, and at most `MAX_USES_PER_SPOT` times per weather (config.py). If a
+  weather asks for more images than its spots allow, the run warns at the start and the
+  extra jobs are listed in `skipped.csv`. Fix by adding maps, raising
+  `MAX_USES_PER_SPOT`, or lowering `images`.
+- **Different views**: at the same spot, the same lane needs at least 6 m more or less
+  distance to count as a new picture (`MIN_VIEW_DISTANCE_GAP`).
+- **Camera and light vary**: ego distance 8-40 m, heading +/-5 deg, camera height
+  +0-0.4 m, camera tilt +/-3 deg, and new sun / cloud values every 5 jobs within the same
+  weather.
+- **More spots**: mid-block crossing spots every 10 m along suitable roads.
+
 **Weathers** run one after another, in the order listed. The weather is set once per
 block, not per image.
 
 ```python
 WEATHERS = {
     "clear":         dict(enabled=True, images=1000, pedestrians=1, vehicles=0, cyclists=0, trucks=0, occlusion=0),
-    "partly_cloudy": dict(enabled=True, images=1000, pedestrians=2, vehicles=1, cyclists=1, trucks=1, occlusion=25),
-    "overcast":      dict(enabled=True, images=1000, pedestrians=3, vehicles=2, cyclists=2, trucks=2, occlusion=50),
-    "rain":          dict(enabled=True, images=1000, pedestrians=4, vehicles=3, cyclists=3, trucks=0, occlusion=75),
-    "snowfall":      dict(enabled=True, images=1000, pedestrians=5, vehicles=4, cyclists=0, trucks=0, occlusion=100),
+    "partly_cloudy": dict(enabled=True, images=1000, pedestrians=2, vehicles=1, cyclists=1, trucks=1, occlusion=(50, 75)),
+    "overcast":      dict(enabled=True, images=1000, pedestrians=3, vehicles=2, cyclists=2, trucks=2, occlusion=(60, 85)),
+    "rain":          dict(enabled=True, images=1000, pedestrians=4, vehicles=3, cyclists=3, trucks=0, occlusion=(70, 95)),
+    "snowfall":      dict(enabled=True, images=1000, pedestrians=5, vehicles=4, cyclists=0, trucks=0, occlusion=(85, 100)),
 }
 ```
 
-- A number is exact; `(min, max)` picks a random value per image.
-- Counts are always met exactly. A scene that cannot fit them is re-planned.
-- `occlusion` is how much of the *target* pedestrian is hidden in occluded scenes.
-  `0` = this weather has no occluded scenes.
+- Counts: a number is exact; `(min, max)` picks a random value per image. Counts are
+  always met exactly; a scene that cannot fit them is re-planned.
+- `occlusion` is a `(min, max)` range in %: how much of the *target* pedestrian is hidden
+  at the most hidden moment of its walk behind a car. `0` = this weather has no occluded
+  scenes. Behind a car that moment is naturally 50-100 % (behind a parked car 70-100 %),
+  because a car covers a person from the feet up to about the chest; the run warns if a
+  range is mostly below 50 %. Lower levels are in the frames before and after it.
 - All weathers are daytime with the sun 70–90° high, so it is never in frame.
 
 **Scene types** inside each weather (`SCENES`, each with an on/off switch and a share):
@@ -191,13 +214,16 @@ WEATHERS = {
 | `crosswalk` | crossing at a marked crosswalk |
 | `jaywalk_road` | crossing mid-block, no crosswalk |
 | `jaywalk_junction` | crossing an arm of a T-junction (3 roads meet) with no crosswalk |
-| `occluded_by_traffic` | 1–2 cars in the lane next to the ego; the pedestrian walks out in front of them |
-| `occluded_by_parked` | a car parked at the curb; the pedestrian steps out from behind it |
+| `occluded_by_traffic` | 1–2 cars in the lane next to the ego; the pedestrian walks behind them |
+| `occluded_by_parked` | a car parked at the curb; the pedestrian walks behind it |
 
-**Occluded scenes are sequences** (`SEQUENCE`). The pedestrian walks slowly (0.6–1.0 m/s)
-and several frames are taken. Their occlusion goes from the weather's value down to
-fully visible: with `frames=5` and 75 %, the frames are about 75, 56, 38, 19 and 0 %
-hidden. With `SEQUENCE.enabled = False`, one frame at the weather's occlusion is taken.
+**Occluded scenes are sequences** (`SEQUENCE`). Seen from the ego, the pedestrian is first
+clearly visible, walks behind the car, and comes out clearly visible again. The planner
+predicts how much of the person is hidden at every 10 cm of the walk and only accepts a
+walk whose most hidden moment lies in the weather's `occlusion` range. With `frames=5`
+the frames are spread over the walk, e.g. 0 % -> 40 % -> 75 % -> 35 % -> 0 % hidden
+(visible, going behind, most hidden, coming out, visible). The person walks slowly
+(0.6-1.0 m/s). With `SEQUENCE.enabled = False`, only the most hidden frame is taken.
 
 **Traffic** is cars, trucks and cyclists/scooters. Each is randomly the same direction as
 the ego or oncoming. Same-direction traffic stays within a 2.4 m ego-lane band.
@@ -208,7 +234,7 @@ the ego or oncoming. Same-direction traffic stays within a 2.4 m ego-lane band.
    pedestrian's walk and frame times, the other pedestrians, and the traffic. Placement
    uses a camera model to predict how much of the pedestrian is hidden at every step.
 2. **Check the plan**: no overlaps, crossing in view, normal traffic never hides the
-   target, and no viewpoint is ever repeated (site + lane + distance + weather + scene).
+   target, and no near-identical view (see "Variety" above).
 3. **Render**: spawn, let the pedestrians walk, and capture RGB, segmentation and depth
    from exactly the same tick. Our traffic is then hidden for one tick to see each
    pedestrian unoccluded.
@@ -230,8 +256,9 @@ A frame is flagged when:
    one kind. Every output of each image is removed, and the rows move to `deleted.csv`.
 4. `python main.py --summary` refreshes the manifest, summary and split lists.
 
-Set `KEEP_FLAGGED_IMAGES = False` to drop failing frames instead (a job whose frames all
-fail is re-planned). A job that never produces an image is listed in `skipped.csv`.
+Set `SKIP_FLAGGED_IMAGES = True` in config.py to **skip** failing frames instead: they are
+never saved (the reason is written to `run_log.txt`), and a job whose frames all fail is
+re-planned. A job that never produces an image is listed in `skipped.csv`.
 
 ## Output files
 
@@ -243,12 +270,42 @@ dataset/
   jobs_done.txt  flagged.csv  skipped.csv  deleted.csv  run_log.txt
 ```
 
-Image names: `<map>_<weather>_<scene>_<job>_<frame>`, e.g.
-`Town10HD_Opt_rain_occluded_by_parked_00012_03.png`.
+Inside every output folder, files are sorted into `<weather>/<scene>/` folders. The file
+name is weather + scene + job number + frame number, so every name is unique in the whole
+dataset:
+
+```
+images/rain/occluded_by_parked/rain_occluded_by_parked_00012_00.png    frame 0 of job 12
+images/rain/occluded_by_parked/rain_occluded_by_parked_00012_01.png    frame 1
+labels/rain/occluded_by_parked/rain_occluded_by_parked_00012_00.txt    same path in every output folder
+```
+
+**Everything in one folder:** set `SAVE_IN_FOLDERS = False` in config.py and the files go
+straight into `dataset/images/`, `dataset/labels/`, ... with the same unique names:
+
+```
+images/rain_occluded_by_parked_00012_00.png
+labels/rain_occluded_by_parked_00012_00.txt
+```
+
+Pick one setting per output folder (changing it half-way makes resume start those jobs again).
+
+With more than one map in `MAPS`, the map comes first (folder and name):
+`images/Town03_Opt/rain/occluded_by_parked/Town03_Opt_rain_occluded_by_parked_00012_00.png`.
+YOLO training works with both layouts as they are (it finds `labels/...` by replacing
+`images/` in the path, and `data.yaml` lists every image).
 
 The box images (`images_2d_bbox/`, `images_3d_bbox/`) draw exactly the objects in the
 YOLO file, in one colour with no text. Set `BOX_COLOR` (OpenCV B, G, R; default green) and
 `BOX_THICKNESS` in `advanced.py`.
+
+**How boxes are labeled.** Every box is measured on the segmentation image, and its class
+comes from CARLA's own semantic tag on that object's pixels: Pedestrian -> `pedestrian`,
+Car -> `vehicle`, Truck / Bus -> `truck`, Bicycle / Motorcycle (with its Rider) ->
+`cyclist`. So a model is labeled by what CARLA says it is, not by which config list it
+came from; the JSON also keeps CARLA's own name (`carla_class`, e.g. `Bus`). A pixel
+only counts for an object if its depth also matches that object's distance, so an object
+hidden behind a wall can never take the box of another, visible object.
 
 YOLO classes: `0 pedestrian, 1 vehicle, 2 truck, 3 cyclist`. `SPLIT_CROSSING_CLASS = True`
 adds `crossing_pedestrian` in front. Pedestrian boxes are full-body by default
@@ -278,7 +335,7 @@ generate_dataset/
     camera.py        planning-time camera: how much of a pedestrian a vehicle hides
     people.py        pedestrian planning: who walks where, how fast
     traffic.py       car / truck / cyclist placement, occluder layouts
-    occlusion.py     occluder + slow walk from hidden to visible
+    occlusion.py     occluder + walk behind it: visible -> hidden -> visible
     planner.py       puts a whole scene plan together and checks it
     carla_io.py      spawning / removing actors; per-map session, weather, capture
     render.py        runs one plan in CARLA and captures its frames

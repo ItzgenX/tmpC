@@ -76,7 +76,8 @@ only watches it and starts it again, which continues from `jobs_done.txt`.
 | **plan** | the dict describing a whole job (section 5) |
 | **tick** | one simulation step = `FIXED_DELTA_SECONDS` = 0.05 s |
 | **sync mode** | CARLA only moves forward when we call `world.tick()`; set during a run, switched off at the end |
-| **signature** | `site + lane + distance bin + weather + scene`; no two jobs may share one (no repeated viewpoint) |
+| **spot use** | how many jobs a crossing site has had in one weather; capped by `MAX_USES_PER_SPOT` |
+| **new view** | at the same site and weather, the same lane needs `MIN_VIEW_DISTANCE_GAP` m more / less distance |
 | **flagged** | an image that failed a quality check: saved anyway and listed in `flagged.csv` |
 | **skipped** | a job that never produced an image (listed in `skipped.csv`) |
 | **ctx** | `SceneContext`: everything the planning helpers need about the scene being built |
@@ -111,7 +112,8 @@ the two files without touching the code.
 | Setting | Used in | Meaning |
 |---|---|---|
 | `OUTPUT_DIR` | main.py | dataset folder (also the resume folder) |
-| `MAPS` | run.py | maps to use, in order; images are split evenly across them |
+| `MAPS` | run.resolve_maps | maps to use, by short name or full path (custom maps too); images are split evenly across them |
+| `MAX_USES_PER_SPOT` | planner._pick_site, run.spot_shortages | how often one crossing spot may be used per weather; None = no limit |
 | `SEED` | run.py, carla_io.py | random seed; same seed + settings = same plans |
 | `CARLA_HOST`, `CARLA_PORT` | everywhere a client is made | server address |
 | `CARLA_EXECUTABLE` | supervisor.py | optional path to start / restart the server |
@@ -123,10 +125,11 @@ the two files without touching the code.
 | `SAME_DIRECTION_CHANCE` | traffic.place_traffic | chance a vehicle drives the ego's way |
 | `SCENE_FOLLOWS_WEATHER` | run.Generator._params | False = counts/occlusion come from a random weather row |
 | `EGO_BLUEPRINT`, `CAR_BLUEPRINTS`, `TRUCK_BLUEPRINTS`, `CYCLIST_BLUEPRINTS` | carla_io.py | vehicle models |
-| `SAVE` | labels.write_frame, carla_io.camera_blueprints | which outputs to write (depth camera only spawned if a depth output is on) |
+| `SAVE` | labels.write_frame | which outputs to write (the depth camera always runs: labels need it) |
 | `PED_YOLO_BOX`, `LABEL_VEHICLES`, `LABEL_FULLY_HIDDEN_PEDESTRIANS`, `SPLIT_CROSSING_CLASS` | labels.py | what goes into the YOLO files |
 | `IMAGE_EXT` | labels.write_frame | `.png` or `.jpg` for RGB |
-| `KEEP_FLAGGED_IMAGES` | run.py | keep (and list) images that fail a check |
+| `SAVE_IN_FOLDERS` | run.build_jobs | True = `<weather>/<scene>/` sub-folders, False = all files in one folder per output type |
+| `SKIP_FLAGGED_IMAGES` | run.py | True = images that fail a check are not saved; False = saved and listed in flagged.csv |
 | `TRAIN_VAL_TEST` | run.write_summary | split ratios, or None |
 
 ### advanced.py (fine tuning), by group
@@ -137,12 +140,12 @@ the two files without touching the code.
 | weather look | `SUN_ALTITUDE_RANGE`, `SUN_AZIMUTH_RANGE`, `WEATHER_LOOK`, `WEATHER_RESAMPLE_EVERY` | carla_io.MapSession.set_weather, run._weather |
 | pedestrians | `PED_SPEED_RANGE`, `PED_RUNNER_PROBABILITY`, `PED_RUN_SPEED_RANGE`, `PED_PROGRESS_RANGE`, `PED_PREROLL_SECONDS`, `PED_MIN_GAP`, `PED_HEIGHT`, `SIDEWALK_PED_DISTANCE`, `SIDEWALK_PED_STANDING_PROBABILITY`, `PED_TYPE_OVERRIDES`, `PED_BLUEPRINT_EXCLUDE` | people.py, carla_io.py |
 | scene types | `OCCLUDED_SCENES`, `SCENE_SITE_KINDS` | run.py, planner.py |
-| occlusion | `OCCLUSION_TOLERANCE`, `OCCLUDER_TRUCK_CHANCE`, `OCCLUDED_EGO_DISTANCE_RANGE`, `ADJACENT_CARS_AHEAD`, `PARKED_NOSE_GAP`, `FULLY_VISIBLE`, `PROTECT_TARGET_MAX_COVER` | occlusion.py, traffic.py, labels.frame_flags |
+| occlusion | `OCCLUSION_TOLERANCE`, `OCCLUSION_NUMBER_SPREAD`, `LOWEST_REACHABLE_OCCLUSION`, `CAR_BODY_HEIGHT`, `CAR_CABIN_LENGTH_PART`, `OCCLUDER_TRUCK_CHANCE`, `OCCLUDED_EGO_DISTANCE_RANGE`, `ADJACENT_CARS_AHEAD`, `PARKED_NOSE_GAP`, `FULLY_VISIBLE`, `PROTECT_TARGET_MAX_COVER` | occlusion.py, traffic.py, labels.frame_flags |
 | crossing sites | `JAYWALK_MIN_DIST_FROM_CROSSWALK`, `JAYWALK_SITE_SPACING`, `JAYWALK_ROAD_WIDTH_RANGE`, `JUNCTION_ARM_OFFSET`, `JUNCTION_MIN_DIST_FROM_CROSSWALK` | roads.py |
-| ego / camera | `EGO_FALLBACK_BLUEPRINT`, `EGO_DISTANCE_RANGE`, `DISTANCE_BIN`, `EGO_YAW_JITTER_DEG`, `EGO_LATERAL_JITTER`, `MAX_VIEW_BEARING_DEG`, `EGO_SIZE`, `IMAGE_W`, `IMAGE_H`, `RGB_SUPERSAMPLE`, `CAMERA_FOV`, `CAMERA_LOCATION`, `CAMERA_PITCH`, `RGB_ATTRIBUTES`, `CAPTURE_SETTLE_TICKS`, `JPEG_QUALITY` | planner, camera, carla_io, labels |
+| ego / camera | `EGO_FALLBACK_BLUEPRINT`, `EGO_DISTANCE_RANGE`, `MIN_VIEW_DISTANCE_GAP`, `CAMERA_LIFT_RANGE`, `CAMERA_PITCH_JITTER_DEG`, `EGO_YAW_JITTER_DEG`, `EGO_LATERAL_JITTER`, `MAX_VIEW_BEARING_DEG`, `EGO_SIZE`, `IMAGE_W`, `IMAGE_H`, `RGB_SUPERSAMPLE`, `CAMERA_FOV`, `CAMERA_LOCATION`, `CAMERA_PITCH`, `RGB_ATTRIBUTES`, `CAPTURE_SETTLE_TICKS`, `JPEG_QUALITY` | planner, camera, carla_io, labels |
 | drawing / folders | `BOX_COLOR`, `BOX_THICKNESS`, `OUTPUT_FOLDERS` | labels.py, tools.py |
 | traffic | `EGO_LANE_WIDTH`, `ONCOMING_MAX_DRIFT`, `CAR_SIZE`, `TRUCK_SIZE`, `CYCLIST_SIZE`, `TRAFFIC_FAR_MAX`, `NEAR_SIDE_PROBABILITY`, `EGO_CLEARANCE`, `VEHICLE_GAP`, `CROSSING_CLEARANCE` | traffic.py |
-| labels / checks | `MIN_VISIBLE_PIXELS`, `MIN_BOX_SIZE_PX`, `MAX_LABEL_DISTANCE`, `LABEL_PARKED_VEHICLES`, `PARKED_VEHICLE_CLASS`, `MIN_TARGET_PIXELS`, `MIN_ROAD_FRACTION`, `SEG_TAGS` | labels.py, render.py, carla_io.py |
+| labels / checks | `TAG_CLASS`, `TAG_NAMES`, `RIDER_TAG`, `DEPTH_MATCH_MARGIN`, `MIN_VISIBLE_PIXELS`, `MIN_BOX_SIZE_PX`, `MAX_LABEL_DISTANCE`, `LABEL_PARKED_VEHICLES`, `PARKED_VEHICLE_CLASS`, `MIN_TARGET_PIXELS`, `MIN_ROAD_FRACTION`, `SEG_TAGS` | labels.py, render.py, carla_io.py |
 | run control | `MAX_RENDERS_PER_JOB`, `MAX_PLANS_PER_JOB`, `RELOAD_WORLD_EVERY`, `MAX_JOBS_PER_PROCESS`, `MAX_CRASHES_WITHOUT_PROGRESS`, `EXIT_*`, `STOP_WAIT_SECONDS` | run.py, supervisor.py |
 
 `SEQUENCE_MAX_SECONDS` is defined but **not used anywhere** (changing it has no effect).
@@ -165,7 +168,7 @@ Exit codes the generator (child) returns to the supervisor:
 | Function | What it does |
 |---|---|
 | `roll(value, rng)` | config count -> number: an int stays, a `(min, max)` pair becomes a random int |
-| `roll_occlusion(value, rng)` | occlusion % (number or range) -> fraction 0..1 |
+| `occlusion_range(value)` | config occlusion -> (min, max) fractions; a single number v means v +- `OCCLUSION_NUMBER_SPREAD` |
 | `max_of(value)` | largest value a count can take (used by checks) |
 | `enabled_weathers()` | weather names that are enabled and have images > 0, in config order |
 | `enabled_scenes()` | scene types that are enabled with share > 0 |
@@ -183,19 +186,22 @@ All of these are plain dicts / lists, so they can be saved to JSON.
 **job** (made by `run.build_jobs`)
 
 ```
-{"name": "Town10HD_Opt_rain_occluded_by_parked_00012", "map": "Town10HD_Opt",
+{"name": "rain/occluded_by_parked/rain_occluded_by_parked_00012", "map": "Town10HD_Opt",
  "weather": "rain", "scene": "occluded_by_parked", "frames": 5, "block_index": 37}
 ```
 `block_index` = place of the job inside its weather block (for weather re-sampling).
+The name is also where the job's files go: `images/rain/occluded_by_parked/rain_occluded_by_parked_00012_00.png`.
+The file name alone is unique; with `SAVE_IN_FOLDERS = False` the folders are dropped
+(`"rain_occluded_by_parked_00012"`). With more than one map the map comes first in both.
 
 **plan** (made by `planner.ScenePlanner.plan`)
 
 | Key | Content |
 |---|---|
 | `job`, `scene`, `weather` | from the job |
-| `signature` | viewpoint key (no two jobs share one) |
+| `signature` | site, lane, distance, weather, scene of this view (for reference) |
 | `counts` | the rolled pedestrians / vehicles / cyclists / trucks |
-| `occlusion_target` | rolled occlusion fraction (0 for non-occluded scenes) |
+| `occlusion_range`, `occlusion_peak` | the weather's (min, max) range, and the planned most-hidden share of the target's walk |
 | `site` | `CrossingSite.to_json()`: id, kind, start, end, length, half_width |
 | `ego` | x, y, z, yaw, pitch, roll, lane, distance, approach |
 | `target_pedestrian` | index into `pedestrians` |
@@ -218,7 +224,8 @@ people `capture_progress`, `lateral_offset`.
 into the JSON: map, job, scene, weather, planned / measured occlusion, flags, image
 size, classes, camera K and world_to_camera, the plan).
 
-**label** (made by `labels.compute_labels`): `kind` (pedestrian/vehicle/truck/cyclist),
+**label** (made by `labels.compute_labels`): `kind` (pedestrian/vehicle/truck/cyclist, from
+CARLA's tags), `carla_class` (CARLA's own name: Pedestrian, Car, Truck, Bus, Motorcycle, Bicycle),
 `source` (spawned/parked), `meta`, `visible`, `bbox_visible`, `bbox_full`
 (pedestrians), `bbox_projected`, `visible_pixels`, `full_pixels`, `occlusion`,
 `truncated`, `depth`, `corners_2d`, `location_world`, `rotation_world`, `dimensions`,
@@ -334,7 +341,7 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 | `SIZE` | planning length / width / height per category |
 | `vehicle_at(ctx, lane, s, drift)` | pose `s` m along the road frame on `lane`, shifted `drift` m to the lane's right |
 | `vehicle_dict(ctx, category, wp, x, y, direction, role)` | builds a vehicle dict (picks model and colour) |
-| `box_of(ctx, v)`, `rect_of(ctx, v)` | planning-camera box / road-frame rectangle of a vehicle |
+| `boxes_of(ctx, v)`, `rect_of(ctx, v)` | planning-camera silhouette boxes (a car = low body + middle cabin; truck / cyclist = one block) / road-frame rectangle of a vehicle |
 | `max_drift(direction, lane, width)` | how far a vehicle may sit off its lane centre (2.4 m ego-lane rule for same-direction traffic) |
 | `_direction_of`, `_lanes_by_direction` | lanes for "same" / "oncoming" traffic |
 | `place_traffic(ctx, category, protect_boxes)` | one normal car / truck / cyclist: before or past the crossing, never on it, never overlapping, never hiding the target |
@@ -346,11 +353,12 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 | Function | What it does |
 |---|---|
 | `STEP` | 0.1 m between predicted positions |
-| `frame_levels(top, n)` | `n` occlusion levels from `top` down to 0 |
+| `EXTEND`, `CLEAR_VIEW` | the walk may go 3 m onto each sidewalk; frames start / end 0.8 m into the visible part |
 | `_occluder_categories(ctx, scene, cars, trucks)` | whether the occluder(s) are cars or a truck (from the job's own counts) |
-| `_walk(ctx, direction, lateral)` | positions along the walk, from the sidewalk to the far curb |
-| `_pick_frames(curve, levels)` | positions where the predicted hidden share first drops through each level |
-| `plan_occluded(ctx, scene, top, cars, trucks, n_frames)` | tries up to 40 layouts (occluders + walk), keeps the one whose first frame is closest to the target occlusion; returns target pedestrian, occluders, frame ticks |
+| `_walk(ctx, direction, lateral)` | positions every 10 cm along the walk, from one sidewalk to the other |
+| `_arcs(curve, lo, hi)` | stretches of the walk "visible -> hidden -> visible" whose most hidden point is in [lo, hi] |
+| `_frame_indices(start, peak, end, n)` | `n` frames spread over that stretch, one exactly at the most hidden point |
+| `plan_occluded(ctx, scene, occ_range, cars, trucks, n_frames)` | tries up to 40 layouts (occluders + a walk across the road, random direction); keeps a walk that goes visible -> hidden -> visible with its most hidden moment closest to a random goal inside `occ_range`; returns target pedestrian, occluders, frame ticks, occupied space, planned peak |
 
 ### engine/planner.py, whole scene plan
 
@@ -360,12 +368,13 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 | `CATEGORY_KEY` | car -> vehicles, truck -> trucks, cyclist -> cyclists |
 | `SceneContext` | bag of everything the helpers need (rng, site, ego, lanes, frame, camera, occupied rectangles, models) |
 | `ScenePlanner(...)` | made once per map with its sites, parked map cars, pedestrian and vehicle models |
-| `.register(plan)` | counts a saved plan: balances site use, remembers its signature |
-| `.sites_of(kinds)`, `._pick_site(rng, kinds)` | sites of given kinds; picks among the least used |
+| `.register(plan)` | counts a saved plan: spot use per weather, and its view (lane, distance) |
+| `._view_is_new(site, weather, ego)` | False if the same lane at this spot (same weather) was used within `MIN_VIEW_DISTANCE_GAP` m |
+| `.sites_of(kinds)`, `._pick_site(rng, kinds, weather)` | sites of given kinds; picks a random one among the least used in this weather, never over `MAX_USES_PER_SPOT` |
 | `.cross_section(site)` | cached `road_cross_section` of a site |
 | `._env_rects(frame)` | the map's parked cars as road-frame rectangles |
-| `.plan_ego(rng, site, distance_range)` | ego pose: lane, distance, small jitter; checks the crossing is ahead and in view |
-| `.plan(rng, job, params)` | the full plan in order: counts -> site -> ego -> signature -> target (+ occluders) -> other people -> traffic -> sidewalk people |
+| `.plan_ego(rng, site, distance_range)` | ego pose: lane, distance, heading jitter, camera lift + tilt (the ego is raised / tilted; the camera is fixed to it); checks the crossing is ahead and in view |
+| `.plan(rng, job, params)` | the full plan in order: counts -> site -> ego -> new-view check -> target (+ occluders) -> other people -> traffic -> sidewalk people |
 
 ### engine/carla_io.py, talking to CARLA
 
@@ -422,11 +431,12 @@ Session part, `MapSession` (one per map):
 | `cam_coords(cam_xyz)` | UE camera axes -> KITTI camera axes |
 | `seg_tags(img)` | class id per pixel from a segmentation image (a copy) |
 | `decode_depth(img)` | depth image -> metres |
-| `_group(kind)` | which segmentation tags belong to a label kind |
-| `_tight(mask, box)`, `_search_box(...)` | tight box around mask pixels in (a slightly grown) box |
-| `_assign_pixels(objs, masks, w, h)` | nearest object first takes its class pixels inside its box |
+| `_group(kind)` | pedestrian pixels or vehicle-like pixels (car, truck, bus, motorcycle, bicycle, rider) |
+| `_search_box(...)` | an object's projected box, slightly grown |
+| `_assign_pixels(objs, masks, depth, w, h)` | nearest object first takes the pixels in its box whose tag fits **and** whose depth matches its own distance |
+| `_carla_class(seg, pix)` | most common CARLA tag on an object's pixels -> (our class, CARLA name); a rider counts with its bicycle / motorcycle |
 | `_big_enough(box, pixels, kind)` | enough pixels and big enough box to label |
-| `compute_labels(objects, seg, seg_full, hood, world_to_cam, K)` | all labels of a frame; `seg_full` (traffic hidden) gives full-body boxes and real occlusion |
+| `compute_labels(objects, seg, seg_full, hood, world_to_cam, K, depth, depth_full)` | all labels of a frame; `seg_full` (traffic hidden) gives full-body boxes and real occlusion |
 | `road_fraction(seg, hood)` | share of road-like pixels (camera-blocked check) |
 | `hood_mask(seg_frames)` | the ego's bonnet pixels at the bottom of the image |
 | `target_label(labels)` | the target pedestrian's label |
@@ -456,10 +466,12 @@ Generator part:
 | `ConnectionLost`, `is_connection_error(exc)` | recognise a dead / hung server |
 | `split_evenly(total, n)`, `exact_counts(n, shares)` | exact integer splits |
 | `scenes_for(weather, available_kinds)` | scene types this weather can have on this map |
-| `build_jobs(map_name, map_index, n_maps, available_kinds)` | the ordered job list: weather blocks, scene types inside |
+| `resolve_maps(wanted, available)` | `MAPS` entries -> (short name, path to load); short name or full path, any case |
+| `spot_shortages(planner, jobs)` | weather/scene combinations asking for more jobs than spots x `MAX_USES_PER_SPOT` (warned at start) |
+| `build_jobs(map_name, map_index, n_maps, available_kinds)` | the ordered job list: weather blocks, scene types inside; job names are folder paths |
 | `Generator(out)` | output folders, progress |
 | `.run(plan_only)` | the whole run (section 1) |
-| `._register_done(session, jobs)` | feeds finished jobs to the planner (site balance, no repeated view) |
+| `._register_done(session, jobs)` | feeds finished jobs to the planner (spot use, views) |
 | `._weather(session, job)` | sets the weather for the job's block |
 | `._params(job, rng)` | the weather row used for this job's counts |
 | `.run_job(session, job)` | plan -> render -> save, retrying until a good one or the limits |
@@ -475,7 +487,8 @@ Generator part:
 |---|---|
 | change counts or occlusion of a weather | `WEATHERS` in config.py |
 | add a weather (e.g. `fog`) | add it to `WEATHERS` (config.py) and its look to `WEATHER_LOOK` (advanced.py) |
-| change frames per occluded walk | `SEQUENCE["frames"]`; levels come from `occlusion.frame_levels` |
+| change frames per occluded walk | `SEQUENCE["frames"]`; spread by `occlusion._frame_indices` |
+| change how hidden the pedestrian gets | `occlusion` (min, max) per weather in config.py |
 | make the reveal faster / slower | `SEQUENCE["walk_speed"]` |
 | change where occluding cars stand | `ADJACENT_CARS_AHEAD`, `PARKED_NOSE_GAP`; logic in `traffic.adjacent_occluders` / `parked_occluder` |
 | add a new scene type | 1) `SCENES` in config.py, 2) `SCENE_SITE_KINDS` (and `OCCLUDED_SCENES` if occluded) in advanced.py, 3) its behaviour in `planner.ScenePlanner.plan` |
@@ -485,11 +498,12 @@ Generator part:
 | add vehicle models | the `*_BLUEPRINTS` lists in config.py; check with `python main.py --check` |
 | fix a wrongly typed pedestrian model | `PED_TYPE_OVERRIDES` in advanced.py |
 | change pedestrian speeds | `PED_SPEED_RANGE`, `PED_RUNNER_PROBABILITY` |
-| add / reorder YOLO classes | `class_names()` in advanced.py, `labels.class_id`, `render.KIND`, `SEG_TAGS`, `MIN_VISIBLE_PIXELS` |
+| add / reorder YOLO classes | `class_names()` in advanced.py, `TAG_CLASS` (CARLA tag -> class), `labels.class_id`, `MIN_VISIBLE_PIXELS` |
 | change when an image is flagged | `labels.frame_flags` and its thresholds (`OCCLUSION_TOLERANCE`, `MIN_TARGET_PIXELS`, `MIN_ROAD_FRACTION`) |
 | change what is saved | `SAVE` in config.py; a new output: add a flag + folder in `OUTPUT_FOLDERS` and write it in `labels.write_frame` |
 | change box drawing | `BOX_COLOR`, `BOX_THICKNESS`; code in `labels.draw_2d` / `draw_3d` |
-| allow more variety per crossing | lower `DISTANCE_BIN`, raise `EGO_DISTANCE_RANGE` |
+| more variety | add maps to `MAPS`; lower `MAX_USES_PER_SPOT`; raise `MIN_VIEW_DISTANCE_GAP`; widen `EGO_DISTANCE_RANGE`, `CAMERA_LIFT_RANGE`, `CAMERA_PITCH_JITTER_DEG` |
+| use a custom map | add its name or path to `MAPS`; check with `python main.py --check` |
 
 ---
 
