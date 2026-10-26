@@ -40,7 +40,7 @@ engine/run.py  Generator.run()
    |     for each job not done yet:
    |        run.py  run_job()
    |           |-- engine/planner.py  ScenePlanner.plan()   the whole scene as DATA
-   |           |      uses camera.py, people.py, traffic.py, occlusion.py, roads.py
+   |           |      uses roads.py, people.py, traffic.py, occlusion.py
    |           |-- engine/render.py   render_job()          spawn the plan in CARLA,
    |           |                                            walk, capture frames
    |           |      uses carla_io.py (spawn / remove), labels.py (measure, check)
@@ -307,7 +307,7 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 | `find_road_sites(...)` | mid-block jaywalk sites: straight roads with sidewalks both sides, far from crosswalks, spaced apart |
 | `find_junction_sites(...)` | one site across each arm of every 3-way junction that has no crosswalk |
 
-### engine/camera.py, planning-time camera
+### engine/roads.py (end of file), planning camera
 
 | Function | What it does |
 |---|---|
@@ -509,8 +509,8 @@ Generator part:
 
 ## 8. Rules to keep when you change code
 
-1. **Plans are data only.** Nothing in planner.py, people.py, traffic.py, occlusion.py,
-   camera.py or roads.py may spawn anything in CARLA. Spawning happens only in
+1. **Plans are data only.** Nothing in planner.py, people.py, traffic.py, occlusion.py
+   or roads.py may spawn anything in CARLA. Spawning happens only in
    render.py / carla_io.py.
 2. **Everything spawned goes into the `actors` list at once** (see `spawn_vehicles`), so
    `render_job`'s `finally` can always remove it, even after an error or Ctrl+C.

@@ -13,8 +13,8 @@ behind the car (hidden), then comes out and is clearly visible again:
 The real occlusion of every frame is measured later from segmentation.
 """
 import advanced as C
-from engine.camera import coverage, in_view, rects_overlap
 from engine.people import crossing_line, make_ped, ped_box, pick_type
+from engine.roads import coverage, in_view, rects_overlap
 from engine.traffic import adjacent_occluders, boxes_of, parked_occluder
 
 

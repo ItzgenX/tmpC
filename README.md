@@ -331,8 +331,8 @@ generate_dataset/
     stop.py          clean stop on Ctrl+C / Ctrl+Z / kill
     supervisor.py    auto-restart after crashes, optional CARLA server start
     tools.py         --check, --delete-flagged, --cleanup
-    roads.py         lanes, sidewalks, crossing sites (crosswalk, mid-block, T-junction)
-    camera.py        planning-time camera: how much of a pedestrian a vehicle hides
+    roads.py         lanes, sidewalks, crossing sites (crosswalk, mid-block, T-junction),
+                     planning camera: how much of a pedestrian a vehicle hides
     people.py        pedestrian planning: who walks where, how fast
     traffic.py       car / truck / cyclist placement, occluder layouts
     occlusion.py     occluder + walk behind it: visible -> hidden -> visible

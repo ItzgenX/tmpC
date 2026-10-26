@@ -5,8 +5,7 @@ Adjacent cars    : 1-2 cars in the lane next to the ego, between ego and crossin
 Parked car       : a car at the curb right before the pedestrian's path (occluder).
 """
 import advanced as C
-from engine.camera import box_corners, coverage, rects_overlap
-from engine.roads import dot, forward_right, lane_key, step_along
+from engine.roads import box_corners, coverage, dot, forward_right, lane_key, rects_overlap, step_along
 
 
 SIZE = {"car": C.CAR_SIZE, "truck": C.TRUCK_SIZE, "cyclist": C.CYCLIST_SIZE}

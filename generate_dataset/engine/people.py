@@ -7,8 +7,7 @@ comes closer than PED_MIN_GAP to another walker and never runs into a vehicle.
 import math
 
 import advanced as C
-from engine.camera import box_corners, rects_overlap
-from engine.roads import forward_right, ground_z, step_along
+from engine.roads import box_corners, forward_right, ground_z, rects_overlap, step_along
 
 
 def weighted_choice(rng, weights):

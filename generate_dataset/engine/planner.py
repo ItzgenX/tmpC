@@ -8,10 +8,9 @@ traffic). A plan that fails any check is thrown away and re-planned.
 import math
 
 import advanced as C
-from engine.camera import Frame, PlanCamera, in_view, rects_overlap
 from engine.occlusion import plan_occluded
 from engine.people import ped_box, plan_crossing, plan_sidewalk, position_at, track
-from engine.roads import dot, forward_right, heading_diff, lane_key, road_cross_section, step_along, sub
+from engine.roads import Frame, PlanCamera, dot, forward_right, heading_diff, in_view, lane_key, rects_overlap, road_cross_section, step_along, sub
 from engine.traffic import place_traffic
 
 
