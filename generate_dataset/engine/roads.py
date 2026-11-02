@@ -1,6 +1,6 @@
 """Map geometry: the lanes across a road, its sidewalks, the places where
-pedestrians cross (marked crosswalks, mid-block, T-junctions), and the planning
-camera that predicts what the dashcam will see.
+pedestrians cross (marked crosswalks, mid-block, T-junctions, roads a car turns
+into), and the planning camera that predicts what the dashcam will see.
 
 All of this runs client-side on the OpenDRIVE map, no server round trips.
 """
@@ -33,10 +33,6 @@ def heading_diff(a, b):
     return abs(d)
 
 
-def xy(loc):
-    return (loc.x, loc.y)
-
-
 def dot(a, b):
     return a[0] * b[0] + a[1] * b[1]
 
@@ -45,6 +41,7 @@ def sub(a, b):
     return (a[0] - b[0], a[1] - b[1])
 
 
+# waypoints and lanes: https://carla.readthedocs.io/en/0.9.16/core_map/#waypoints
 def step_along(wp, dist, forward=True):
     """Waypoint `dist` metres ahead/behind on the same lane, straightest branch at junctions."""
     if dist < 0.05:
@@ -123,6 +120,8 @@ def ground_z(carla_map, x, y, z_hint):
 # crosswalk : a real marked crosswalk
 # road      : mid-block on a straight road with sidewalks on both sides (jaywalking)
 # junction  : an arm of a T-junction (3 roads meet) with no crosswalk (jaywalking)
+# turn      : a road a car can turn into (left or right) at any junction; the crossing
+#             is the crosswalk just past the junction, or a line across the road there
 #
 # A site is a straight crossing line across the road (start curb -> end curb)
 # plus the driving waypoint whose lanes the traffic and ego are planned on.
@@ -140,6 +139,7 @@ class CrossingSite:
         self.length = math.hypot(dx, dy)
         self.axis = (dx / self.length, dy / self.length)    # unit, start -> end
         self.along, _ = forward_right(road_wp.transform.rotation.yaw)
+        self.turns = []                       # turn sites: the junction lanes that turn into this road
 
     def to_json(self):
         return {
@@ -155,13 +155,16 @@ def find_all_sites(carla_map, cfg):
                            cfg.JAYWALK_SITE_SPACING, cfg.JAYWALK_ROAD_WIDTH_RANGE)
     junction = find_junction_sites(carla_map, cw, cfg.JUNCTION_MIN_DIST_FROM_CROSSWALK,
                                    cfg.JUNCTION_ARM_OFFSET, cfg.JAYWALK_ROAD_WIDTH_RANGE)
+    turn = find_turn_sites(carla_map, cw, cfg.JUNCTION_ARM_OFFSET, cfg.JAYWALK_ROAD_WIDTH_RANGE,
+                           cfg.TURN_ANGLE_RANGE, cfg.TURN_FAR_CROSSING)
     print(f"  sites: {len(cw)} crosswalk ({bad} unusable polygons), {len(road)} mid-block, "
-          f"{len(junction)} T-junction")
-    return cw + road + junction
+          f"{len(junction)} T-junction, {len(turn)} turn")
+    return cw + road + junction + turn
 
 
 # ---------- marked crosswalks ----------
 
+# https://carla.readthedocs.io/en/0.9.16/python_api/#carla.Map.get_crosswalks
 def parse_crosswalk_polygons(carla_map):
     # get_crosswalks() is a flat point list; each polygon repeats its first point to close
     polys, cur = [], []
@@ -321,6 +324,105 @@ def find_junction_sites(carla_map, crosswalk_sites, min_dist_from_crosswalk, arm
     return sites
 
 
+# ---------- roads a car turns into (any junction) ----------
+
+TURN_STEP = 0.5             # metres between the points of a turn path
+
+
+def _crosswalk_past(wp, crosswalk_sites, search=15.0):
+    """The marked crosswalk across wp's road just past the junction, or None."""
+    loc = wp.transform.location
+    f, r = forward_right(wp.transform.rotation.yaw)
+    best = None
+    for s in crosswalk_sites:
+        d = sub(s.center[:2], (loc.x, loc.y))
+        ahead = dot(d, f)
+        if -6.0 <= ahead <= search and abs(dot(d, r)) < 12.0 and abs(dot(s.along, f)) > 0.8:
+            if best is None or abs(ahead) < abs(best[0]):
+                best = (ahead, s)
+    return best[1] if best else None
+
+
+# junction lanes: https://carla.readthedocs.io/en/0.9.16/core_map/#junctions
+def find_turn_sites(carla_map, crosswalk_sites, arm_offset, width_range, angle_range, far_offset):
+    """Two sites per road leaving a junction that cars can turn into: the crossing at the
+    junction exit (its crosswalk, or a line arm_offset m into the road) and a line far_offset
+    m into the road (people crossing a little past the junction, where the turning cars are
+    straight again). Their `turns` are the junction lanes turning into that road:
+    {"start", "end" (junction waypoints), "side", "entry_road"}."""
+    exits, seen = {}, set()
+    for wp in carla_map.generate_waypoints(3.0):
+        if not wp.is_junction:
+            continue
+        junction = wp.get_junction()
+        if junction is None or junction.id in seen:
+            continue
+        seen.add(junction.id)
+        for a, b in junction.get_waypoints(carla.LaneType.Driving):
+            turn = (b.transform.rotation.yaw - a.transform.rotation.yaw + 180.0) % 360.0 - 180.0
+            if not angle_range[0] <= abs(turn) <= angle_range[1]:
+                continue
+            entry = step_along(a, 2.0, forward=False)
+            out = step_along(b, arm_offset, forward=True)
+            if entry is None or out is None or out.is_junction:
+                continue
+            e = exits.setdefault((junction.id, out.road_id), {"wp": out, "turns": []})
+            # CARLA is left-handed: a growing yaw turns right
+            e["turns"].append({"start": a, "end": b, "side": "right" if turn > 0 else "left",
+                               "entry_road": entry.road_id})
+
+    sites = []
+    for (jid, road_id), e in sorted(exits.items()):
+        lines = []
+        cw = _crosswalk_past(e["wp"], crosswalk_sites)
+        if cw is not None:
+            lines.append(("near", cw.start, cw.end, cw.half_width, e["wp"]))
+        else:
+            ends = _curb_to_curb(e["wp"], width_range)
+            if ends is not None:
+                lines.append(("near", ends[0], ends[1], 1.5, e["wp"]))
+        far = step_along(e["wp"], far_offset - arm_offset, forward=True)
+        if far is not None and not far.is_junction:
+            ends = _curb_to_curb(far, width_range)
+            if ends is not None:
+                lines.append(("far", ends[0], ends[1], 1.5, far))
+        for name, start, end, half, wp in lines:
+            site = CrossingSite(f"tn{jid}_{road_id}_{name}", "turn", start, end, half, wp)
+            site.turns = e["turns"]
+            sites.append(site)
+    return sites
+
+
+def turn_path(start, end, back, ahead, step=TURN_STEP):
+    """Points (x, y, z, yaw, waypoint) every `step` m along one turn: from `back` m before
+    the junction, along the junction lane start -> end, to `ahead` m past the junction."""
+    before, wp = [], start
+    for _ in range(int(back / step)):
+        wp = step_along(wp, step, forward=False)
+        if wp is None:
+            break
+        before.append(wp)
+    pts, wp, past = list(reversed(before)) + [start], start, None
+    end_loc = end.transform.location
+    for _ in range(4000):
+        nxt = wp.next(step)
+        if not nxt:
+            break
+        if past is None:            # still inside the junction: stay on the lane that leads to `end`
+            wp = min(nxt, key=lambda c: c.transform.location.distance(end_loc))
+            if not wp.is_junction or wp.transform.location.distance(end_loc) < step:
+                past = 0.0
+        else:
+            yaw = wp.transform.rotation.yaw
+            wp = min(nxt, key=lambda c: heading_diff(c.transform.rotation.yaw, yaw))
+            past += step
+            if past > ahead:
+                break
+        pts.append(wp)
+    return [(w.transform.location.x, w.transform.location.y, w.transform.location.z,
+             w.transform.rotation.yaw, w) for w in pts]
+
+
 # ============================================================================
 # planning camera
 # ============================================================================
@@ -338,6 +440,14 @@ class Frame:
     def local(self, x, y):
         d = sub((x, y), self.o)
         return dot(d, self.f), dot(d, self.r)
+
+
+def footprint(frame, x, y, yaw, length, width):
+    """(long, lat, length, width) rectangle in `frame` that holds a box turned by `yaw`."""
+    lo, la = frame.local(x, y)
+    f, _ = forward_right(yaw)
+    c, s = abs(dot(f, frame.f)), abs(dot(f, frame.r))
+    return lo, la, length * c + width * s, length * s + width * c
 
 
 def rects_overlap(a, b, gap_long, gap_lat):
@@ -362,7 +472,8 @@ class PlanCamera:
         self.focal = C.IMAGE_W / (2.0 * math.tan(math.radians(C.CAMERA_FOV) / 2.0))
 
     def box(self, corners):
-        """2D box [x0, y0, x1, y1] and mean depth of 3D corners, None if behind the camera."""
+        """2D box [x0, y0, x1, y1], mean depth and on-screen outline (convex polygon) of
+        3D corners, or None if behind the camera."""
         us, vs, ds = [], [], []
         for p in corners:
             d = (p[0] - self.pos[0], p[1] - self.pos[1], p[2] - self.pos[2])
@@ -372,7 +483,36 @@ class PlanCamera:
             us.append(C.IMAGE_W / 2 + self.focal * sum(a * b for a, b in zip(d, self.R)) / depth)
             vs.append(C.IMAGE_H / 2 - self.focal * sum(a * b for a, b in zip(d, self.U)) / depth)
             ds.append(depth)
-        return [min(us), min(vs), max(us), max(vs)], sum(ds) / len(ds)
+        return [min(us), min(vs), max(us), max(vs)], sum(ds) / len(ds), _hull(list(zip(us, vs)))
+
+
+def _hull(points):
+    """Convex hull (counter-clockwise) of 2D points."""
+    pts = sorted(set(points))
+    if len(pts) < 3:
+        return pts
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) >= 2 and ((out[-1][0] - out[-2][0]) * (p[1] - out[-2][1])
+                                     - (out[-1][1] - out[-2][1]) * (p[0] - out[-2][0])) <= 0:
+                out.pop()
+            out.append(p)
+        return out
+
+    lower, upper = half(pts), half(reversed(pts))
+    return lower[:-1] + upper[:-1]
+
+
+def _inside(poly, x, y):
+    """Point inside a convex counter-clockwise polygon."""
+    n = len(poly)
+    for i in range(n):
+        (ax, ay), (bx, by) = poly[i], poly[(i + 1) % n]
+        if (bx - ax) * (y - ay) - (by - ay) * (x - ax) < 0:
+            return False
+    return n >= 3
 
 
 def box_corners(x, y, z, yaw_deg, length, width, height):
@@ -394,25 +534,27 @@ def in_view(box):
 
 
 def coverage(target, occluders, samples=12):
-    """Fraction of the target's on-screen box hidden by nearer occluder boxes (union),
-    estimated on a samples x samples grid. Only the part of the target inside the image counts."""
+    """Fraction of the target's on-screen box hidden by nearer occluders (union of their
+    on-screen outlines), estimated on a samples x samples grid. Only the part of the
+    target inside the image counts."""
     if target is None:
         return 0.0
     t = target[0]
     x0, y0 = max(t[0], 0.0), max(t[1], 0.0)
     x1, y1 = min(t[2], float(C.IMAGE_W)), min(t[3], float(C.IMAGE_H))
     # only nearer occluders whose box actually touches the target's box (fast path: none)
-    near = [o[0] for o in occluders if o is not None and o[1] < target[1]
+    near = [(o[0], o[2]) for o in occluders if o is not None and o[1] < target[1]
             and o[0][0] < x1 and o[0][2] > x0 and o[0][1] < y1 and o[0][3] > y0]
     if x1 <= x0 or y1 <= y0 or not near:
         return 0.0
-    if any(o[0] <= x0 and o[1] <= y0 and o[2] >= x1 and o[3] >= y1 for o in near):
+    corners = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    if any(all(_inside(hull, *c) for c in corners) for _, hull in near):
         return 1.0                                  # one occluder covers it completely
     hidden = 0
     for i in range(samples):
         px = x0 + (i + 0.5) * (x1 - x0) / samples
         for j in range(samples):
             py = y0 + (j + 0.5) * (y1 - y0) / samples
-            if any(o[0] <= px <= o[2] and o[1] <= py <= o[3] for o in near):
+            if any(b[0] <= px <= b[2] and b[1] <= py <= b[3] and _inside(hull, px, py) for b, hull in near):
                 hidden += 1
     return hidden / (samples * samples)

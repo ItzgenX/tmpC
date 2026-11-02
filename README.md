@@ -30,6 +30,8 @@ For every image you get (each output can be switched off):
    ```bash
    cd generate_dataset
    python main.py --check           # once: checks ego car, pedestrian types, car/truck/cyclist ids, maps
+   python main.py --self-test       # once: renders every occlusion layout and checks it came out right
+   python main.py --weather-preview # optional: one picture sheet of every weather setting at 0..100
    python main.py --plan-only 5     # optional: plans 5 jobs per weather + scene, renders nothing
    python main.py                   # generates the dataset into generate_dataset/dataset/
    python main.py --delete-flagged  # lists problem images; add --yes to delete them
@@ -52,8 +54,8 @@ Run every command from the `generate_dataset` folder. Start CARLA first, except 
 
 1. Connects to CARLA, loads the map from `MAPS`, and removes any leftover cars, people
    or cameras.
-2. Finds the places where people can cross: marked crosswalks, straight roads, and
-   T-junctions.
+2. Finds the places where people can cross: marked crosswalks, straight roads,
+   T-junctions, and the roads cars turn into at junctions.
 3. Builds the job list: all clear-weather images first (crosswalk, jaywalk, occluded),
    then the next weather, and so on.
 4. For each job:
@@ -141,6 +143,43 @@ You normally don't need it: Ctrl+C already does this, and every run cleans up fi
 for a program killed hard (`kill -9`, a crash, closing the machine) when CARLA is left
 frozen or full of leftover actors.
 
+### `python main.py --self-test`
+
+**Checks in CARLA that occluded scenes come out as planned.** Run it once on a new
+machine, map or CARLA version, before a long run. For every occluder layout (see
+"Occluded scenes" below) it plans and renders 2 scenes on the first map in `MAPS` and
+checks each one:
+
+- every car and the pedestrian really are where the plan put them, at every frame;
+- measured from the segmentation, the pedestrian is clearly visible in the first and
+  last frame and mostly hidden in between (visible -> hidden -> visible);
+- the pedestrian is labeled `Pedestrian`, the occluding cars `Car` / `Truck` / `Bus`.
+
+It prints `ok` / `FAIL` per scene, with the measured occlusion of each frame, and saves
+the frames with their 2D boxes to `dataset/self_test/` so you can look at them. Nothing is
+added to the dataset. A layout the map has no place for is reported as `skip`.
+
+- `--self-test 5`: 5 scenes per layout instead of 2.
+
+### `python main.py --weather-preview`
+
+**Shows what each weather setting looks like**, so you can choose the `(min, max)` ranges
+in `WEATHER_LOOK` (advanced.py). It sets up one street view on the first map in `MAPS`
+(a crossing with 3 people and a car, so you can judge how well people stay visible) and
+photographs it with one setting at a time at 0, 25, 50, 75 and 100, everything else at 0
+and the sun high:
+
+| Row | Setting |
+|---|---|
+| 1-6 | `cloudiness`, `fog_density`, `wind_intensity`, `precipitation`, `precipitation_deposits` (puddles), `wetness` (wet road look) |
+| 7 | rain: `cloudiness`, `precipitation`, `precipitation_deposits` and `wetness` all at that level |
+| 8 | camera brightness `exposure_compensation` -1.5 .. +0.5 on a cloudy sky (-1.5 is CARLA's default on Linux; +1 = 2x brighter) |
+
+Result: `dataset/weather_preview/sheet.jpg` (all rows in one picture) and every picture
+full size next to it (`cloudiness_050.jpg`, `exposure_-1.0.jpg`, ...). `wind_intensity` only
+moves trees and flags, so it barely shows in a still picture. To use a brightness, add
+`"exposure_compensation": <value>` to `RGB_ATTRIBUTES` in advanced.py.
+
 ## Stopping
 
 Stop any time with **Ctrl+C**. **Ctrl+Z**, `kill <pid>` and closing the terminal do the
@@ -214,16 +253,35 @@ WEATHERS = {
 | `crosswalk` | crossing at a marked crosswalk |
 | `jaywalk_road` | crossing mid-block, no crosswalk |
 | `jaywalk_junction` | crossing an arm of a T-junction (3 roads meet) with no crosswalk |
-| `occluded_by_traffic` | 1–2 cars in the lane next to the ego; the pedestrian walks behind them |
+| `occluded_by_traffic` | 1–2 cars ahead of the ego, right in front of it or in the lane next to it; the pedestrian walks behind them |
 | `occluded_by_parked` | a car parked at the curb; the pedestrian walks behind it |
+| `occluded_turning` | the ego turns left or right at a junction behind 1–2 cars turning the same way; the pedestrian crosses the road they turn into, behind the car(s) |
 
 **Occluded scenes are sequences** (`SEQUENCE`). Seen from the ego, the pedestrian is first
 clearly visible, walks behind the car, and comes out clearly visible again. The planner
 predicts how much of the person is hidden at every 10 cm of the walk and only accepts a
 walk whose most hidden moment lies in the weather's `occlusion` range. With `frames=5`
 the frames are spread over the walk, e.g. 0 % -> 40 % -> 75 % -> 35 % -> 0 % hidden
-(visible, going behind, most hidden, coming out, visible). The person walks slowly
-(0.6-1.0 m/s). With `SEQUENCE.enabled = False`, only the most hidden frame is taken.
+(visible, going behind, most hidden, coming out, visible). "Visible" frames show the
+whole person inside the picture. The person walks slowly (0.6-1.0 m/s). With
+`SEQUENCE.enabled = False`, only the most hidden frame is taken.
+
+The occluder layouts, picked at random for each scene:
+
+| Layout | Scene |
+|---|---|
+| ego -> car -> pedestrian (same lane) | `occluded_by_traffic` |
+| ego -> car -> car -> pedestrian (same lane) | `occluded_by_traffic` |
+| 1 or 2 cars in the lane next to the ego -> pedestrian | `occluded_by_traffic` |
+| parked car -> pedestrian | `occluded_by_parked` |
+| turning left: ego -> car (-> car) -> pedestrian | `occluded_turning` |
+| turning right: ego -> car (-> car) -> pedestrian | `occluded_turning` |
+
+Same lane or next lane is 50/50 (`OCCLUDER_SAME_LANE_CHANCE` in `advanced.py`). In a turn the
+pedestrian crosses either at the junction exit (its crosswalk, or a line there) or a
+little further down that road (`TURN_FAR_CROSSING`, 12 m), where the turning cars are
+straight again. Two cars in a left turn fit only on bigger junctions, so that layout is
+the rarest; a layout that does not fit at a spot is simply re-planned.
 
 **Traffic** is cars, trucks and cyclists/scooters. Each is randomly the same direction as
 the ego or oncoming. Same-direction traffic stays within a 2.4 m ego-lane band.
@@ -270,30 +328,35 @@ dataset/
   jobs_done.txt  flagged.csv  skipped.csv  deleted.csv  run_log.txt
 ```
 
-Inside every output folder, files are sorted into `<weather>/<scene>/` folders. The file
-name is weather + scene + job number + frame number, so every name is unique in the whole
-dataset:
+Every output folder is flat (no sub-folders), and one image has the same name in all of
+them. The name is `<weather>_<scene>_<number>`, the number counting up from `00001`:
 
 ```
-images/rain/occluded_by_parked/rain_occluded_by_parked_00012_00.png    frame 0 of job 12
-images/rain/occluded_by_parked/rain_occluded_by_parked_00012_01.png    frame 1
-labels/rain/occluded_by_parked/rain_occluded_by_parked_00012_00.txt    same path in every output folder
+images/clear_crosswalk_00001.png
+images/rain_occluded_00001.png      \
+images/rain_occluded_00002.png       |
+images/rain_occluded_00003.png       |  one walk behind a car: 5 numbers in a row
+images/rain_occluded_00004.png       |
+images/rain_occluded_00005.png      /
+images/rain_occluded_00006.png         the next walk
+depth/rain_occluded_00001.png          same name in every output folder
+labels/rain_occluded_00001.txt
 ```
 
-**Everything in one folder:** set `SAVE_IN_FOLDERS = False` in config.py and the files go
-straight into `dataset/images/`, `dataset/labels/`, ... with the same unique names:
+| name part | weather / scene |
+|---|---|
+| `clear`, `cloudy`, `overcast`, `rain`, `snow` | clear, partly_cloudy, overcast, rain, snowfall |
+| `crosswalk`, `jaywalk`, `junction` | crosswalk, jaywalk_road, jaywalk_junction |
+| `occluded` | occluded_by_traffic, occluded_by_parked, occluded_turning |
 
-```
-images/rain_occluded_by_parked_00012_00.png
-labels/rain_occluded_by_parked_00012_00.txt
-```
-
-Pick one setting per output folder (changing it half-way makes resume start those jobs again).
-
-With more than one map in `MAPS`, the map comes first (folder and name):
-`images/Town03_Opt/rain/occluded_by_parked/Town03_Opt_rain_occluded_by_parked_00012_00.png`.
-YOLO training works with both layouts as they are (it finds `labels/...` by replacing
-`images/` in the path, and `data.yaml` lists every image).
+The short names are in `NAME_CODES` in `advanced.py`; a weather you add yourself keeps
+its own name. Scenes that share a short name share one counter, so names never clash.
+With more than one map in `MAPS`, a map code comes first: `t03_rain_occluded_00001.png`
+(Town03_Opt -> `t03`, Town10HD_Opt -> `t10hd`, a custom map keeps its name). Weather,
+exact scene type, map and the walk an image belongs to (`job`) are in its `labels_3d`
+JSON and in `manifest.csv`. YOLO training uses the folders as they are (`data.yaml`
+lists every image). With `SKIP_FLAGGED_IMAGES = True` a skipped frame leaves a gap in the
+numbers.
 
 The box images (`images_2d_bbox/`, `images_3d_bbox/`) draw exactly the objects in the
 YOLO file, in one colour with no text. Set `BOX_COLOR` (OpenCV B, G, R; default green) and
@@ -305,7 +368,9 @@ Car -> `vehicle`, Truck / Bus -> `truck`, Bicycle / Motorcycle (with its Rider) 
 `cyclist`. So a model is labeled by what CARLA says it is, not by which config list it
 came from; the JSON also keeps CARLA's own name (`carla_class`, e.g. `Bus`). A pixel
 only counts for an object if its depth also matches that object's distance, so an object
-hidden behind a wall can never take the box of another, visible object.
+hidden behind a wall can never take the box of another, visible object. The full-body
+box of a pedestrian comes from a frame with our traffic moved away, so the car in front
+never cuts it.
 
 YOLO classes: `0 pedestrian, 1 vehicle, 2 truck, 3 cyclist`. `SPLIT_CROSSING_CLASS = True`
 adds `crossing_pedestrian` in front. Pedestrian boxes are full-body by default
@@ -331,8 +396,8 @@ generate_dataset/
     stop.py          clean stop on Ctrl+C / Ctrl+Z / kill
     supervisor.py    auto-restart after crashes, optional CARLA server start
     tools.py         --check, --delete-flagged, --cleanup
-    roads.py         lanes, sidewalks, crossing sites (crosswalk, mid-block, T-junction),
-                     planning camera: how much of a pedestrian a vehicle hides
+    roads.py         lanes, sidewalks, crossing sites (crosswalk, mid-block, T-junction,
+                     turn), planning camera: how much of a pedestrian a vehicle hides
     people.py        pedestrian planning: who walks where, how fast
     traffic.py       car / truck / cyclist placement, occluder layouts
     occlusion.py     occluder + walk behind it: visible -> hidden -> visible
@@ -341,7 +406,36 @@ generate_dataset/
     render.py        runs one plan in CARLA and captures its frames
     labels.py        labels from segmentation, quality checks, saving outputs
     run.py           job list, job loop, progress files, summary
+    selftest.py      --self-test: every occluder layout, rendered and checked in CARLA
+    weather_preview.py  --weather-preview: picture sheet of every weather setting
+tests/             unit tests, run without CARLA (see "Tests")
 ```
+
+## Tests
+
+The tests run **without CARLA**, on a small fake CARLA in `tests/fake/carla.py`: a city
+block with a 4-way junction (turn lanes, crosswalks, sidewalks) that draws segmentation
+and depth from the actors' shapes. They use their own fixed settings, so your
+`config.py` does not change the result. From the `Dataset_Generation` folder:
+
+```bash
+python -m unittest discover -s tests            # everything (about 2 minutes)
+python -m unittest discover -s tests -v         # with the name of every check
+python -m unittest discover -s tests -p test_layouts.py     # one file
+```
+
+| File | Checks |
+|---|---|
+| `test_layouts.py` | every occluder layout (same lane, next lane, parked, turning left / right, 1 or 2 cars): cars in the right lane and order (ego -> car(s) -> pedestrian), walk visible -> hidden -> visible, and 3D sight lines from the camera really blocked by a car at the most hidden frame |
+| `test_render.py` | every layout through the real render code: cars and pedestrian exactly where planned at every frame, the rendered segmentation goes visible -> hidden -> visible, CARLA classes on the boxes |
+| `test_labels.py` | CARLA classes (Truck, Bicycle + rider), a hidden car never takes a visible car's box, the full-body box is not cut by the car in front |
+| `test_names.py` | flat, unique file names; numbers in a row per walk; map code with several maps |
+| `test_run.py` | a small full run: every image has all its files, every scene type is made, resume adds nothing, flagged images kept / deleted / skipped |
+| `test_variety.py` | spots used evenly and at most `MAX_USES_PER_SPOT`, views 6 m apart, camera height varies, maps by short name or path |
+| `test_stop.py` | Ctrl+C / Ctrl+Z / kill stop cleanly, and the world is emptied even with Ctrl+C pressed again during cleanup |
+| `test_selftest.py`, `test_weather_preview.py` | `--self-test` and `--weather-preview` themselves |
+
+The tests check the code; `python main.py --self-test` checks the same things in real CARLA.
 
 ## Known limitations
 

@@ -10,7 +10,7 @@ import math
 import advanced as C
 from engine.occlusion import plan_occluded
 from engine.people import ped_box, plan_crossing, plan_sidewalk, position_at, track
-from engine.roads import Frame, PlanCamera, dot, forward_right, heading_diff, in_view, lane_key, rects_overlap, road_cross_section, step_along, sub
+from engine.roads import Frame, PlanCamera, dot, footprint, forward_right, heading_diff, in_view, lane_key, rects_overlap, road_cross_section, step_along, sub, turn_path
 from engine.traffic import place_traffic
 
 
@@ -39,6 +39,7 @@ class ScenePlanner:
         self.usage = {}                       # (site id, weather) -> jobs made there
         self.views = {}                       # (site id, weather) -> [(lane, distance), ...]
         self._xs_cache = {}
+        self._turn_cache = {}
 
     def register(self, plan):
         """Count a saved job: spreads jobs over all spots, and blocks near-identical views."""
@@ -129,12 +130,65 @@ class ScenePlanner:
                "lane": lane_key(lane), "distance": round(dist, 2), "approach": group}
         return ego, xs, group
 
+    def turn_paths(self, site):
+        """Every turn into a turn site's road, as points along the turn (cached)."""
+        if site.id not in self._turn_cache:
+            paths = []
+            for t in site.turns:        # through the junction and 10 m past the crossing
+                end = t["end"].transform.location
+                paths.append(turn_path(t["start"], t["end"], C.TURN_PATH_BACK,
+                                       math.hypot(site.center[0] - end.x, site.center[1] - end.y) + 10.0))
+            self._turn_cache[site.id] = paths
+        return self._turn_cache[site.id]
+
+    def plan_turn_ego(self, rng, site, side=None):
+        """Ego on a left / right turn into the site's road, at a point where the crossing
+        is ahead and in view. Returns (ego, cross-section, group, turn info)."""
+        choices = [k for k, t in enumerate(site.turns) if side in (None, t["side"])]
+        if not choices:
+            raise PlanError(f"no {side} turn into this road")
+        k = rng.choice(choices)
+        turn, paths = site.turns[k], self.turn_paths(site)
+        path = paths[k]
+        cx, cy = site.center[:2]
+        lo_d, hi_d = C.TURN_EGO_DISTANCE_RANGE
+        cands = []
+        for i, (x, y, _, yaw, _) in enumerate(path):
+            to_c = (cx - x, cy - y)
+            dist = math.hypot(*to_c)
+            if not lo_d <= dist <= hi_d or dot(to_c, site.along) < site.half_width + 3.0:
+                continue        # too near / far, or the crossing is not ahead yet
+            if heading_diff(math.degrees(math.atan2(to_c[1], to_c[0])), yaw) <= C.TURN_VIEW_BEARING_DEG:
+                cands.append(i)
+        if not cands:
+            raise PlanError("crossing never in view during this turn")
+        i = rng.choice(cands)
+        x, y, z, yaw, wp = path[i]
+        _, r = forward_right(yaw)
+        lat_j = rng.uniform(-0.15, 0.15)
+        ex, ey = x + r[0] * lat_j, y + r[1] * lat_j
+        lift = rng.uniform(*C.CAMERA_LIFT_RANGE)
+        tilt = rng.uniform(-C.CAMERA_PITCH_JITTER_DEG, C.CAMERA_PITCH_JITTER_DEG)
+        ego = {"x": ex, "y": ey, "z": z + lift, "yaw": yaw + rng.uniform(-3.0, 3.0),
+               "pitch": wp.transform.rotation.pitch + tilt, "roll": wp.transform.rotation.roll,
+               "camera_lift": round(lift, 3), "lane": lane_key(wp),
+               "distance": round(math.hypot(cx - ex, cy - ey), 2), "approach": f"turn_{turn['side']}"}
+        parallel = [paths[j] for j, t in enumerate(site.turns)
+                    if j != k and t["side"] == turn["side"] and t["entry_road"] == turn["entry_road"]]
+        info = {"side": turn["side"], "path": path, "ego_index": i, "parallel": parallel}
+        # the site's road is the one turned into: its lanes leaving the junction are "same"
+        return ego, self.cross_section(site), "same", info
+
     # ---------- one job ----------
 
     def plan(self, rng, job, params):
-        """job = {"name", "weather", "scene", "frames"}; params = the weather row to use."""
+        """job = {"name", "weather", "scene", "frames"} (+ optional "layout": {"lane": "ego" /
+        "next", "cars": 1 / 2, "side": "left" / "right"} to force one occluder layout, used by
+        the tests and --self-test); params = the weather row to use."""
         scene = job["scene"]
+        layout = job.get("layout") or {}
         occluded = scene in C.OCCLUDED_SCENES
+        turning = scene == "occluded_turning"
         counts = {k: C.roll(params.get(k), rng) for k in C.COUNT_KEYS}
         requested = dict(counts)
         occ_range = C.occlusion_range(params.get("occlusion")) if occluded else (0.0, 0.0)
@@ -146,25 +200,30 @@ class ScenePlanner:
             raise PlanError("no pedestrian blueprints")
 
         site = self._pick_site(rng, C.SCENE_SITE_KINDS[scene], job["weather"])
-        ego, xs, ego_group = self.plan_ego(
-            rng, site, C.OCCLUDED_EGO_DISTANCE_RANGE if occluded else C.EGO_DISTANCE_RANGE)
+        turn = None
+        if turning:
+            ego, xs, ego_group, turn = self.plan_turn_ego(rng, site, layout.get("side"))
+        else:
+            ego, xs, ego_group = self.plan_ego(
+                rng, site, C.OCCLUDED_EGO_DISTANCE_RANGE if occluded else C.EGO_DISTANCE_RANGE)
         if not self._view_is_new(site, job["weather"], ego):
             raise PlanError("too close to a view already used at this spot")
         signature = f"{site.id}|{ego['lane']}|{ego['distance']:.1f}|{job['weather']}|{scene}"
 
-        # road-aligned frame (not the jittered ego heading), pointing the way the ego drives
+        # road-aligned frame (not the jittered ego heading), pointing the way the ego drives;
+        # a turning ego drives the way of the road it turns into
         road_yaw = math.degrees(math.atan2(site.along[1], site.along[0]))
-        if heading_diff(road_yaw, ego["yaw"]) > 90:
+        if not turning and heading_diff(road_yaw, ego["yaw"]) > 90:
             road_yaw += 180.0
         frame = Frame(site.center[:2], road_yaw)
         env_rects = self._env_rects(frame)
-        ego_rect = (*frame.local(ego["x"], ego["y"]), *C.EGO_SIZE)
+        ego_rect = footprint(frame, ego["x"], ego["y"], ego["yaw"], *C.EGO_SIZE)
         if any(rects_overlap(ego_rect, r, 0.5, 0.2) for r in env_rects):
             raise PlanError("ego spot overlaps a parked car")
         ctx = SceneContext(rng=rng, map=self.map, site=site, ego=ego, xs=xs, ego_group=ego_group,
                            frame=frame, cam=PlanCamera(ego, self.ego_z_offset),
                            rects=env_rects + [ego_rect], walker_pools=self.walker_pools,
-                           blueprints=self.blueprints)
+                           blueprints=self.blueprints, layout=layout, turn=turn)
 
         # --- target pedestrian (+ occluders) and frame timing ---
         tracks = []
@@ -216,9 +275,12 @@ class ScenePlanner:
 
         peds += plan_sidewalk(ctx, C.roll(C.SIDEWALK_PEDESTRIANS, rng), first_s, total_s, tracks)
 
+        occluders = [v for v in vehicles if v["role"] == "occluder"]
         return {
             "job": job["name"], "scene": scene, "weather": job["weather"], "signature": signature,
             "counts": requested, "occlusion_range": [round(v, 3) for v in occ_range], "occlusion_peak": peak,
+            "layout": {"occluder_lane": occluders[0]["occluder_lane"] if occluders else None,
+                       "occluders": len(occluders), "turn": turn["side"] if turn else None},
             "site": site.to_json(), "ego": ego,
             "target_pedestrian": target_index, "frames": frames,
             "pedestrians": peds, "vehicles": vehicles,

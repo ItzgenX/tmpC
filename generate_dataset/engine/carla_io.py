@@ -80,6 +80,7 @@ def _set_attrs(bp, attrs):
             bp.set_attribute(k, str(v))
 
 
+# camera attributes: https://carla.readthedocs.io/en/0.9.16/ref_sensors/
 def camera_blueprints(bp_lib):
     rgb = bp_lib.find("sensor.camera.rgb")
     _set_attrs(rgb, {
@@ -227,6 +228,7 @@ def spawn_pedestrians(world, bp_lib, plan_peds, actors):
     return spawned
 
 
+# https://carla.readthedocs.io/en/0.9.16/core_actors/#walkers
 def start_walking(walkers, plan_peds):
     # plain WalkerControl, no AI controller: nothing tied to the crowd-nav manager
     for w, p in zip(walkers, plan_peds):
@@ -253,6 +255,7 @@ class MapSession:
 
     # ---------- world ----------
 
+    # synchronous mode, fixed time step: https://carla.readthedocs.io/en/0.9.16/adv_synchrony_timestep/
     def _set_sync(self, on):
         s = self.world.get_settings()
         s.synchronous_mode = on
@@ -287,6 +290,7 @@ class MapSession:
         for label_name, cls in C.PARKED_VEHICLE_CLASS.items():
             label = getattr(self.carla.CityObjectLabel, label_name, None)
             if label is not None:
+                # https://carla.readthedocs.io/en/0.9.16/python_api/#carla.World.get_environment_objects
                 self.parked += [(o, cls, label_name) for o in self.world.get_environment_objects(label)]
         env = [(o.bounding_box.location.x, o.bounding_box.location.y, o.bounding_box.extent.x,
                 o.bounding_box.extent.y, o.bounding_box.rotation.yaw) for o, _, _ in self.parked]
@@ -303,10 +307,11 @@ class MapSession:
 
     def _spawn_ego(self):
         rng = random.Random(f"{C.SEED}:{self.map_name}:ego")
+        straight = [s for s in self.planner.sites if s.kind != "turn"] or self.planner.sites
         poses = []
         for _ in range(300):
             try:
-                poses.append(self.planner.plan_ego(rng, rng.choice(self.planner.sites))[0])
+                poses.append(self.planner.plan_ego(rng, rng.choice(straight))[0])
             except PlanError:
                 continue
             if len(poses) == 3:
@@ -356,6 +361,7 @@ class MapSession:
 
     # ---------- weather ----------
 
+    # parameters: https://carla.readthedocs.io/en/0.9.16/python_api/#carla.WeatherParameters
     def set_weather(self, name, key, rng):
         """Applies a new look of weather `name` only when `key` changes (start of a
         weather block, or every WEATHER_RESAMPLE_EVERY jobs). Returns the parameters."""

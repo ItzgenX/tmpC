@@ -36,8 +36,10 @@ SCENES = {
     "crosswalk":           dict(enabled=True, share=1),   # crossing at a marked crosswalk
     "jaywalk_road":        dict(enabled=True, share=1),   # crossing mid-block, no crosswalk
     "jaywalk_junction":    dict(enabled=True, share=1),   # crossing where 3 roads meet, no crosswalk
-    "occluded_by_traffic": dict(enabled=True, share=1),   # pedestrian walks behind 1-2 cars next to the ego
+    "occluded_by_traffic": dict(enabled=True, share=1),   # pedestrian walks behind 1-2 cars ahead of the ego (its lane or the next)
     "occluded_by_parked":  dict(enabled=True, share=1),   # pedestrian walks behind a car parked at the curb
+    "occluded_turning":    dict(enabled=True, share=1),   # ego turns left / right at a junction behind 1-2 cars;
+                                                          # the pedestrian crosses the road they turn into
 }
 
 # --- occluded pedestrians: seen from the ego, they walk behind the car and out again ---
@@ -91,8 +93,6 @@ LABEL_VEHICLES = True               # False = YOLO files contain pedestrians onl
 LABEL_FULLY_HIDDEN_PEDESTRIANS = False   # YOLO box for a pedestrian that cannot be seen at all
 SPLIT_CROSSING_CLASS = False        # True = crossing people get their own YOLO class
 IMAGE_EXT = ".png"                  # RGB image format: ".png" (lossless) or ".jpg" (smaller)
-SAVE_IN_FOLDERS = True              # True = images/clear/crosswalk/clear_crosswalk_00012_00.png
-                                    # False = all in one folder: images/clear_crosswalk_00012_00.png
 
 # --- problem images ---
 # False: images that fail a check are saved anyway and listed in flagged.csv (review them,

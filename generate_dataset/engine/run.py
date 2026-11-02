@@ -202,16 +202,27 @@ def spot_shortages(planner, jobs):
     return out
 
 
-def build_jobs(map_name, map_index, n_maps, available_kinds):
+def map_codes(names):
+    """Short map names for file names: Town03_Opt -> t03, MyCity -> mycity.
+    Two maps that would get the same code keep their full (lower-case) names."""
+    def code(n):
+        n = n.lower()
+        n = n[:-4] if n.endswith("_opt") else n
+        return "t" + n[4:] if n.startswith("town") else n
+    codes = {n: code(n) for n in names}
+    clash = {c for c in codes.values() if list(codes.values()).count(c) > 1}
+    return {n: (n.lower() if c in clash else c).replace("_", "-") for n, c in codes.items()}
+
+
+def build_jobs(map_name, map_index, n_maps, available_kinds, map_code=""):
     """The full, ordered job list for one map: weather blocks, scene types inside each.
 
-    A job's name is also where its files go, e.g. "rain/occluded_by_parked/rain_occluded_by_parked_00012"
-    -> images/rain/occluded_by_parked/rain_occluded_by_parked_00012_00.png. The file name
-    alone is unique in the whole dataset; SAVE_IN_FOLDERS = False drops the folders.
-    The map is added (folder and name) only when more than one map is used.
+    Every image gets a running number per short name: "rain_occluded_00001", "_00002", ...
+    (no sub-folders; with more than one map, `map_code` comes first: "t03_rain_occluded_00001").
+    A job's `images` are its frames' names, numbers in a row; its name is its first image.
     """
-    folder = [map_name] if n_maps > 1 else []
-    jobs = []
+    prefix = [map_code] if n_maps > 1 and map_code else []
+    jobs, used = [], collections.Counter()          # short name -> numbers given out
     for weather in C.enabled_weathers():
         n = split_evenly(C.WEATHERS[weather]["images"], n_maps)[map_index]
         scenes = scenes_for(weather, available_kinds)
@@ -219,17 +230,15 @@ def build_jobs(map_name, map_index, n_maps, available_kinds):
             continue
         per_scene = exact_counts(n, {s: C.SCENES[s]["share"] for s in scenes})
         for scene in scenes:
-            left, j, size = per_scene[scene], 0, C.frames_per_job(scene)
+            base = "_".join(prefix + [C.short_name(weather), C.short_name(scene)])
+            left, size = per_scene[scene], C.frames_per_job(scene)
             while left > 0:
                 frames = min(size, left)
-                parts = folder + [weather, scene]
-                name = "_".join(parts + [f"{j:05d}"])
-                if C.SAVE_IN_FOLDERS:
-                    name = "/".join(parts + [name])
-                jobs.append({"name": name, "map": map_name,
+                images = [f"{base}_{used[base] + k + 1:05d}" for k in range(frames)]
+                used[base] += frames
+                jobs.append({"name": images[0], "images": images, "map": map_name,
                              "weather": weather, "scene": scene, "frames": frames})
                 left -= frames
-                j += 1
     return jobs
 
 
@@ -280,6 +289,7 @@ class Generator:
                       f"normally hides ({C.LOWEST_REACHABLE_OCCLUSION:.0%}+ at the most hidden moment); "
                       f"most occluded jobs will be skipped. use e.g. (50, 75)")
         maps, missing = resolve_maps(C.MAPS, self.client.get_available_maps())
+        codes = map_codes([name for name, _ in maps])
         for m in missing:
             print(f"  warning: map {m} is not on this server (see python main.py --check), skipped")
         if not maps:
@@ -303,7 +313,7 @@ class Generator:
                 if missing:
                     print(f"  {map_name}: no place for {', '.join(missing)} on this map - "
                           f"those images go to the other scene types")
-                jobs = build_jobs(map_name, map_index, len(maps), kinds)
+                jobs = build_jobs(map_name, map_index, len(maps), kinds, codes[map_name])
                 if jobs:
                     usable_maps += 1
                 for what, n, spots in spot_shortages(session.planner, jobs):
@@ -343,10 +353,12 @@ class Generator:
         for job in jobs:
             if job["name"] not in self.progress.done:
                 continue
-            path = os.path.join(self.out, "labels_3d", job["name"] + "_00.json")
-            if os.path.exists(path):
-                with open(path, encoding="utf-8") as f:
-                    session.planner.register(json.load(f)["plan"])
+            for image in job["images"]:         # the first frame that was saved
+                path = os.path.join(self.out, "labels_3d", image + ".json")
+                if os.path.exists(path):
+                    with open(path, encoding="utf-8") as f:
+                        session.planner.register(json.load(f)["plan"])
+                    break
 
     # ---------- one job ----------
 
@@ -408,9 +420,9 @@ class Generator:
         saved = 0
         for k, frame in enumerate(frames):
             if frame["flags"] and C.SKIP_FLAGGED_IMAGES:
-                self.log(f"{job['name']}_{k:02d} not saved: {'; '.join(frame['flags'])}")
+                self.log(f"{job['images'][k]} not saved: {'; '.join(frame['flags'])}")
                 continue
-            name = f"{job['name']}_{k:02d}"
+            name = job["images"][k]
             write_frame(self.out, name, frame)
             saved += 1
             if frame["flags"]:

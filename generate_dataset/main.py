@@ -7,6 +7,8 @@
     python main.py --delete-flagged --yes   delete them (add --reason <text> for one kind only)
     python main.py --summary                rebuild manifest.csv, summary.txt and split lists
     python main.py --cleanup                empty the CARLA world and switch it back to normal (async) mode
+    python main.py --self-test              check in CARLA that every occlusion layout comes out as planned
+    python main.py --weather-preview        one picture sheet: what each weather setting looks like at 0..100
 
 Stop any time with Ctrl+C, Ctrl+Z, kill <pid> or by closing the terminal: the
 CARLA world is emptied and switched back to normal mode before the program
@@ -50,6 +52,10 @@ def main():
     ap.add_argument("--yes", action="store_true", help="with --delete-flagged: actually delete")
     ap.add_argument("--summary", action="store_true", help="only rebuild manifest / summary / splits")
     ap.add_argument("--cleanup", action="store_true", help="only empty the CARLA world and set async mode")
+    ap.add_argument("--self-test", type=int, nargs="?", const=2, default=0, metavar="N",
+                    help="render N scenes (default 2) of every occlusion layout in CARLA and check them")
+    ap.add_argument("--weather-preview", action="store_true",
+                    help="picture sheet of every weather setting at 0, 25, 50, 75, 100")
     ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     install_stop_handlers()
@@ -67,6 +73,16 @@ def main():
     if args.cleanup:
         from engine.tools import cleanup_only
         return cleanup_only()
+    if args.self_test or args.weather_preview:
+        try:
+            if args.weather_preview:
+                from engine.weather_preview import run_weather_preview
+                return run_weather_preview(args.out)
+            from engine.selftest import run_self_test
+            return run_self_test(args.out, args.self_test)
+        except KeyboardInterrupt:
+            print("\nstopped. the CARLA world has been emptied.")
+            return C.EXIT_STOPPED
     if args.worker or args.plan_only:
         return run_worker(args)
     from engine.supervisor import supervise

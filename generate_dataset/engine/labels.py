@@ -33,6 +33,7 @@ def intrinsics(width=C.IMAGE_W, height=C.IMAGE_H, fov=C.CAMERA_FOV):
     return np.array([[f, 0, width / 2.0], [0, f, height / 2.0], [0, 0, 1.0]])
 
 
+# same projection as CARLA's bounding box tutorial: https://carla.readthedocs.io/en/0.9.16/tuto_G_bounding_boxes/
 def project(points, world_to_cam, K):
     """World points (N,3) -> pixels (N,2), depth (N,), camera coords. UE camera: x fwd, y right, z up."""
     homog = np.hstack([points, np.ones((len(points), 1))])
@@ -51,11 +52,13 @@ def cam_coords(cam_xyz):
 
 # ---------- raw images ----------
 
+# tag in the red channel: https://carla.readthedocs.io/en/0.9.16/ref_sensors/#semantic-segmentation-camera
 def seg_tags(img):
     arr = np.frombuffer(img.raw_data, dtype=np.uint8).reshape(img.height, img.width, 4)
     return arr[:, :, 2].copy()      # copy: convert() later rewrites the buffer
 
 
+# formula from https://carla.readthedocs.io/en/0.9.16/ref_sensors/#depth-camera
 def decode_depth(img):
     """CARLA depth image -> float32 metres (H, W). Sky reads as ~1000 m."""
     a = np.frombuffer(img.raw_data, dtype=np.uint8).reshape(img.height, img.width, 4).astype(np.float32)
@@ -125,7 +128,7 @@ def compute_labels(objects, seg, seg_full, hood, world_to_cam, K, depth=None, de
     h, w = seg.shape
     masks = {"pedestrian": np.isin(seg, C.SEG_TAGS["pedestrian"]),
              "vehicle": np.isin(seg, list(C.TAG_CLASS)) & ~np.isin(seg, C.SEG_TAGS["pedestrian"]) & ~hood}
-    masks_full = dict(masks, pedestrian=np.isin(seg_full, C.SEG_TAGS["pedestrian"]))
+    masks_full = {"pedestrian": np.isin(seg_full, C.SEG_TAGS["pedestrian"])}
 
     cand = []
     for o in objects:
@@ -150,7 +153,12 @@ def compute_labels(objects, seg, seg_full, hood, world_to_cam, K, depth=None, de
                          cam_xyz=c_cam[0]))
 
     visible = _assign_pixels(cand, masks, depth, w, h)
-    full = _assign_pixels(cand, masks_full, depth_full if depth_full is not None else depth, w, h)
+    # unoccluded silhouettes: our traffic was moved away for that frame, so only the
+    # pedestrians take pixels there (a hidden car must not take the pixels behind it)
+    peds = [i for i, o in enumerate(cand) if o["group"] == "pedestrian"]
+    full_peds = _assign_pixels([cand[i] for i in peds], masks_full,
+                               depth_full if depth_full is not None else depth, w, h)
+    full = {i: full_peds[k] for k, i in enumerate(peds)}
 
     labels = []
     for i, o in enumerate(cand):
@@ -348,7 +356,7 @@ def _json_default(o):
 
 def write_frame(out, name, frame):
     """frame: dict with rgb, depth_m, seg, seg_color, labels, info (json extras).
-    `name` may contain sub-folders (e.g. "rain/crosswalk/00012_00"); they are created."""
+    `name` is the file name without extension, e.g. "rain_occ-parked_00012_00"."""
     def path(flag, ext, folder=None):
         p = os.path.join(out, folder or FOLDERS[flag], name + ext)
         os.makedirs(os.path.dirname(p), exist_ok=True)

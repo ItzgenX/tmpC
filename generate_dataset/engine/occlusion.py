@@ -5,7 +5,8 @@ behind the car (hidden), then comes out and is clearly visible again:
 
     visible  ->  partly hidden  ->  most hidden  ->  partly hidden  ->  visible
 
-1. Put the occluder(s) in place: 1-2 cars next to the ego, or a car parked at the curb.
+1. Put the occluder(s) in place: 1-2 cars right in front of the ego or in the lane next
+   to it, 1-2 cars ahead of the turning ego, or a car parked at the curb.
 2. Along the pedestrian's walk across the road, predict (camera model) how much of
    them is hidden at every 10 cm.
 3. Find a stretch "visible -> hidden -> visible" whose most hidden point lies in the
@@ -14,8 +15,8 @@ The real occlusion of every frame is measured later from segmentation.
 """
 import advanced as C
 from engine.people import crossing_line, make_ped, ped_box, pick_type
-from engine.roads import coverage, in_view, rects_overlap
-from engine.traffic import adjacent_occluders, boxes_of, parked_occluder
+from engine.roads import coverage, rects_overlap
+from engine.traffic import boxes_of, lane_occluders, parked_occluder, turning_occluders
 
 
 STEP = 0.1              # metres between predicted positions
@@ -24,6 +25,9 @@ CLEAR_VIEW = 0.8        # metres walked fully visible before / after the hidden 
 
 
 def _occluder_categories(ctx, scene, cars, trucks):
+    forced = ctx.layout.get("cars")             # a layout given for the job: that many cars
+    if forced:
+        return ["car"] * forced if cars >= forced else None
     use_truck = trucks > 0 and (cars == 0 or ctx.rng.random() < C.OCCLUDER_TRUCK_CHANCE)
     if scene == "occluded_by_parked":
         return ["truck" if use_truck else "car"]
@@ -47,6 +51,30 @@ def _walk(ctx, direction, lateral):
         out.append((s, ox + d[0] * s, oy + d[1] * s))
         s += STEP
     return out, d
+
+
+def _well_in_view(box, keep=0.8):
+    """At least `keep` of the pedestrian's on-screen box is inside the image (a person
+    half outside the picture is no "clearly visible" frame)."""
+    if box is None:
+        return False
+    x0, y0, x1, y1 = box[0]
+    inside_w = min(x1, C.IMAGE_W) - max(x0, 0.0)
+    inside_h = min(y1, C.IMAGE_H) - max(y0, 0.0)
+    if inside_w <= 0 or inside_h <= 0:
+        return False
+    return inside_w * inside_h >= keep * max(x1 - x0, 1e-6) * max(y1 - y0, 1e-6)
+
+
+def _may_hide(ctx, probe, walk, boxes):
+    """Quick test before the expensive curve: can any occluder be in front of some part of
+    the walk on screen? False only when that is clearly impossible."""
+    peds = [ped_box(ctx, probe, x, y) for _, x, y in (walk[0], walk[len(walk) // 2], walk[-1])]
+    if any(p is None for p in peds):
+        return True                 # part of the walk is behind the camera: cannot tell
+    x0, x1 = min(p[0][0] for p in peds), max(p[0][2] for p in peds)
+    far = max(p[1] for p in peds)
+    return any(b is not None and b[1] < far and b[0][0] < x1 and b[0][2] > x0 for b in boxes)
 
 
 def _arcs(curve, lo, hi):
@@ -88,7 +116,8 @@ def _frame_indices(start, peak, end, n):
     if n == 2:                                          # too short for the whole arc: visible, then hidden
         return [start, peak]
     idx = [round(start + (end - start) * k / (n - 1)) for k in range(n)]
-    nearest = min(range(n), key=lambda k: abs(idx[k] - peak))
+    # move the middle frame nearest to the peak onto it; first and last stay visible
+    nearest = min(range(1, n - 1), key=lambda k: abs(idx[k] - peak))
     idx[nearest] = peak
     return sorted(set(idx))
 
@@ -110,8 +139,14 @@ def plan_occluded(ctx, scene, occ_range, cars, trucks, n_frames):
 
         rects = list(ctx.rects)
         cats = _occluder_categories(ctx, scene, cars, trucks)
-        placed = (parked_occluder(ctx, cats[0], ped_long, rects) if scene == "occluded_by_parked"
-                  else adjacent_occluders(ctx, cats, ped_long, rects))
+        if cats is None:
+            return None
+        if scene == "occluded_by_parked":
+            placed = parked_occluder(ctx, cats[0], ped_long, rects)
+        elif scene == "occluded_turning":
+            placed = turning_occluders(ctx, cats, ped_long, rects)
+        else:
+            placed = lane_occluders(ctx, cats, ped_long, rects)
         if placed is None:
             continue
         occluders, occ_rects = placed
@@ -119,10 +154,12 @@ def plan_occluded(ctx, scene, occ_range, cars, trucks, n_frames):
 
         walk, d = _walk(ctx, ctx.rng.choice((1, -1)), lateral)
         probe = {"ground_z": ctx.site.center[2], "yaw": 0.0, "type": ptype}
+        if not _may_hide(ctx, probe, walk, boxes):
+            continue
         curve = []
         for _, x, y in walk:
             box = ped_box(ctx, probe, x, y)
-            curve.append(coverage(box, boxes) if in_view(box) else -1.0)
+            curve.append(coverage(box, boxes) if _well_in_view(box) else -1.0)
 
         for start, peak, end in _arcs(curve, lo, hi):
             # the target must never walk into its own occluder

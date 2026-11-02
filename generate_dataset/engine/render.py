@@ -73,6 +73,9 @@ def _finish_frame(session, plan, planned, imgs, full_imgs, objects, cam_tf, worl
 
     loc, rot = cam_tf.location, cam_tf.rotation
     return {
+        # where every spawned walker / vehicle really was at this tick (not saved; --self-test)
+        "positions": [{"kind": o["kind"], "plan_index": o["meta"]["plan_index"], "center": o["center"]}
+                      for o in objects if o["source"] == "spawned"],
         "rgb": np.ascontiguousarray(rgb),
         "seg": seg,
         "seg_color": np.ascontiguousarray(seg_color),
@@ -130,10 +133,10 @@ def scene_objects(session, plan, walkers, vehicles, cam_tf):
             "walking_direction": (("left_to_right" if dx * cam_right.x + dy * cam_right.y > 0 else "right_to_left")
                                   if crossing else ("along_sidewalk" if p["speed"] > 0 else "standing")),
         }))
-    for actor, v in zip(vehicles, plan["vehicles"]):
+    for idx, (actor, v) in enumerate(zip(vehicles, plan["vehicles"])):
         objs.append(box_obj(actor, KIND[v["category"]], {
-            "actor_id": actor.id, "blueprint": v["blueprint"], "direction": v["direction"],
-            "role": v["role"], "parked": v.get("parked", False)}))
+            "actor_id": actor.id, "plan_index": idx, "blueprint": v["blueprint"], "direction": v["direction"],
+            "role": v["role"], "parked": v.get("parked", False), "occluder_lane": v.get("occluder_lane")}))
 
     if C.LABEL_PARKED_VEHICLES:
         cl = cam_tf.location

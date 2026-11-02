@@ -15,6 +15,27 @@ Contents:
 7. [How to change common things](#7-how-to-change-common-things)
 8. [Rules to keep when you change code](#8-rules-to-keep-when-you-change-code)
 9. [Finding problems](#9-finding-problems)
+10. [Tests](#10-tests)
+
+**Official CARLA documentation** for the CARLA ideas this code uses (version 0.9.16;
+the code has the same link next to where it uses it):
+
+| Concept | Used in | CARLA docs |
+|---|---|---|
+| synchronous mode, fixed time step, `world.tick()` | carla_io `_set_sync`, `capture` | [Synchrony and time-step](https://carla.readthedocs.io/en/0.9.16/adv_synchrony_timestep/) |
+| RGB / depth / segmentation cameras and their attributes | carla_io `camera_blueprints` | [Sensors reference](https://carla.readthedocs.io/en/0.9.16/ref_sensors/) |
+| depth image -> metres | labels `decode_depth` | [Depth camera](https://carla.readthedocs.io/en/0.9.16/ref_sensors/#depth-camera) |
+| semantic tags (Pedestrian 12, Car 14, ...) | advanced `SEG_TAGS`, `TAG_CLASS`; labels `seg_tags` | [Semantic segmentation camera](https://carla.readthedocs.io/en/0.9.16/ref_sensors/#semantic-segmentation-camera) |
+| 3D box -> 2D image (world-to-camera matrix, K) | labels `project`, `compute_labels` | [Bounding boxes tutorial](https://carla.readthedocs.io/en/0.9.16/tuto_G_bounding_boxes/) |
+| waypoints, lanes, `next` / `previous`, left / right lane | roads.py | [Maps: waypoints](https://carla.readthedocs.io/en/0.9.16/core_map/#waypoints) |
+| junctions and their lanes | roads `find_junction_sites`, `find_turn_sites` | [Maps: junctions](https://carla.readthedocs.io/en/0.9.16/core_map/#junctions), [carla.Junction](https://carla.readthedocs.io/en/0.9.16/python_api/#carla.Junction) |
+| crosswalk polygons | roads `parse_crosswalk_polygons` | [carla.Map.get_crosswalks](https://carla.readthedocs.io/en/0.9.16/python_api/#carla.Map.get_crosswalks) |
+| walkers moved by `WalkerControl` | carla_io `start_walking` | [Actors: walkers](https://carla.readthedocs.io/en/0.9.16/core_actors/#walkers) |
+| weather | carla_io `set_weather` | [carla.WeatherParameters](https://carla.readthedocs.io/en/0.9.16/python_api/#carla.WeatherParameters) |
+| parked cars baked into the map | carla_io `MapSession.open` | [carla.World.get_environment_objects](https://carla.readthedocs.io/en/0.9.16/python_api/#carla.World.get_environment_objects) |
+
+Everything else (the scene planner, occlusion planning, label checks) is specific to
+this generator; CARLA has nothing similar to reuse.
 
 ---
 
@@ -67,12 +88,14 @@ only watches it and starts it again, which continues from `jobs_done.txt`.
 |---|---|
 | **job** | one planned scene. Makes 1 image, or several (a *sequence*) for occluded scenes |
 | **frame** | one saved image of a job, with all its outputs |
-| **scene type** | `crosswalk`, `jaywalk_road`, `jaywalk_junction`, `occluded_by_traffic`, `occluded_by_parked` |
+| **scene type** | `crosswalk`, `jaywalk_road`, `jaywalk_junction`, `occluded_by_traffic`, `occluded_by_parked`, `occluded_turning` |
 | **site** | a place where people cross: a straight line from one curb to the other (`CrossingSite`) |
-| **site kind** | `crosswalk` (marked), `road` (mid-block), `junction` (T-junction arm) |
+| **site kind** | `crosswalk` (marked), `road` (mid-block), `junction` (T-junction arm), `turn` (a road cars turn into at a junction) |
 | **ego** | our own car; the cameras are attached to it |
 | **target pedestrian** | the crossing person whose occlusion is controlled and checked |
 | **occluder** | a car/truck placed to hide the target |
+| **layout** | where the occluders are: `ego` (right in front of the ego, same lane / same turn), `next` (the lane beside it), `parked`; 1 or 2 cars; for turns `left` / `right` |
+| **turn path** | the points (every 0.5 m) a car follows through one left / right turn, from before the junction into the road turned into |
 | **plan** | the dict describing a whole job (section 5) |
 | **tick** | one simulation step = `FIXED_DELTA_SECONDS` = 0.05 s |
 | **sync mode** | CARLA only moves forward when we call `world.tick()`; set during a run, switched off at the end |
@@ -90,9 +113,11 @@ only watches it and starts it again, which continues from `jobs_done.txt`.
 - **Distances** are metres, **speeds** m/s, **angles** degrees, **time** seconds or ticks.
 - **CARLA world** is left-handed: x forward, y right, z up. A heading (`yaw`) points to
   `(cos yaw, sin yaw)`; its right side is `(-sin yaw, cos yaw)` (`roads.forward_right`).
-- **Road frame** (`camera.Frame`), used by the planner: origin at the crossing centre,
+- **Road frame** (`roads.Frame`), used by the planner: origin at the crossing centre,
   `long` = along the road in the ego's driving direction (positive = past the crossing,
-  the ego is at about `-distance`), `lat` = to the right of that direction.
+  the ego is at about `-distance`), `lat` = to the right of that direction. In a turn
+  scene the frame follows the road being turned into. A turned car takes up the
+  rectangle `roads.footprint` gives.
 - **Lanes** have an id: one sign drives one way, the other sign the other way.
   `road_cross_section` sorts lanes into `same` (as the site's waypoint) and `opposite`.
 - **Camera (planning, `PlanCamera`) and UE camera coordinates**: x forward, y right, z up.
@@ -128,7 +153,6 @@ the two files without touching the code.
 | `SAVE` | labels.write_frame | which outputs to write (the depth camera always runs: labels need it) |
 | `PED_YOLO_BOX`, `LABEL_VEHICLES`, `LABEL_FULLY_HIDDEN_PEDESTRIANS`, `SPLIT_CROSSING_CLASS` | labels.py | what goes into the YOLO files |
 | `IMAGE_EXT` | labels.write_frame | `.png` or `.jpg` for RGB |
-| `SAVE_IN_FOLDERS` | run.build_jobs | True = `<weather>/<scene>/` sub-folders, False = all files in one folder per output type |
 | `SKIP_FLAGGED_IMAGES` | run.py | True = images that fail a check are not saved; False = saved and listed in flagged.csv |
 | `TRAIN_VAL_TEST` | run.write_summary | split ratios, or None |
 
@@ -140,15 +164,15 @@ the two files without touching the code.
 | weather look | `SUN_ALTITUDE_RANGE`, `SUN_AZIMUTH_RANGE`, `WEATHER_LOOK`, `WEATHER_RESAMPLE_EVERY` | carla_io.MapSession.set_weather, run._weather |
 | pedestrians | `PED_SPEED_RANGE`, `PED_RUNNER_PROBABILITY`, `PED_RUN_SPEED_RANGE`, `PED_PROGRESS_RANGE`, `PED_PREROLL_SECONDS`, `PED_MIN_GAP`, `PED_HEIGHT`, `SIDEWALK_PED_DISTANCE`, `SIDEWALK_PED_STANDING_PROBABILITY`, `PED_TYPE_OVERRIDES`, `PED_BLUEPRINT_EXCLUDE` | people.py, carla_io.py |
 | scene types | `OCCLUDED_SCENES`, `SCENE_SITE_KINDS` | run.py, planner.py |
-| occlusion | `OCCLUSION_TOLERANCE`, `OCCLUSION_NUMBER_SPREAD`, `LOWEST_REACHABLE_OCCLUSION`, `CAR_BODY_HEIGHT`, `CAR_CABIN_LENGTH_PART`, `OCCLUDER_TRUCK_CHANCE`, `OCCLUDED_EGO_DISTANCE_RANGE`, `ADJACENT_CARS_AHEAD`, `PARKED_NOSE_GAP`, `FULLY_VISIBLE`, `PROTECT_TARGET_MAX_COVER` | occlusion.py, traffic.py, labels.frame_flags |
+| occlusion | `OCCLUSION_TOLERANCE`, `OCCLUSION_NUMBER_SPREAD`, `LOWEST_REACHABLE_OCCLUSION`, `CAR_BODY_HEIGHT`, `CAR_CABIN_LENGTH_PART`, `OCCLUDER_TRUCK_CHANCE`, `OCCLUDED_EGO_DISTANCE_RANGE`, `ADJACENT_CARS_AHEAD` (next lane: first car's rear this far ahead of the ego), `PARKED_NOSE_GAP`, `OCCLUDER_SAME_LANE_CHANCE` (same lane vs next lane), `SAME_LANE_GAP` (ego's front bumper to the first car in its lane / turn), `FULLY_VISIBLE`, `PROTECT_TARGET_MAX_COVER` | occlusion.py, traffic.py, labels.frame_flags |
+| turning | `TURN_ANGLE_RANGE` (heading change of a left / right turn), `TURN_EGO_DISTANCE_RANGE`, `TURN_VIEW_BEARING_DEG` (crossing at most this far off the ego's heading), `TURN_PATH_BACK` (turn path starts this far before the junction), `TURN_CAR_GAP` (gap between 2 cars queuing through a turn), `TURN_FAR_CROSSING` (2nd crossing line this far into the road turned into) | roads.find_turn_sites, planner.plan_turn_ego, traffic.turning_occluders |
 | crossing sites | `JAYWALK_MIN_DIST_FROM_CROSSWALK`, `JAYWALK_SITE_SPACING`, `JAYWALK_ROAD_WIDTH_RANGE`, `JUNCTION_ARM_OFFSET`, `JUNCTION_MIN_DIST_FROM_CROSSWALK` | roads.py |
 | ego / camera | `EGO_FALLBACK_BLUEPRINT`, `EGO_DISTANCE_RANGE`, `MIN_VIEW_DISTANCE_GAP`, `CAMERA_LIFT_RANGE`, `CAMERA_PITCH_JITTER_DEG`, `EGO_YAW_JITTER_DEG`, `EGO_LATERAL_JITTER`, `MAX_VIEW_BEARING_DEG`, `EGO_SIZE`, `IMAGE_W`, `IMAGE_H`, `RGB_SUPERSAMPLE`, `CAMERA_FOV`, `CAMERA_LOCATION`, `CAMERA_PITCH`, `RGB_ATTRIBUTES`, `CAPTURE_SETTLE_TICKS`, `JPEG_QUALITY` | planner, camera, carla_io, labels |
 | drawing / folders | `BOX_COLOR`, `BOX_THICKNESS`, `OUTPUT_FOLDERS` | labels.py, tools.py |
 | traffic | `EGO_LANE_WIDTH`, `ONCOMING_MAX_DRIFT`, `CAR_SIZE`, `TRUCK_SIZE`, `CYCLIST_SIZE`, `TRAFFIC_FAR_MAX`, `NEAR_SIDE_PROBABILITY`, `EGO_CLEARANCE`, `VEHICLE_GAP`, `CROSSING_CLEARANCE` | traffic.py |
 | labels / checks | `TAG_CLASS`, `TAG_NAMES`, `RIDER_TAG`, `DEPTH_MATCH_MARGIN`, `MIN_VISIBLE_PIXELS`, `MIN_BOX_SIZE_PX`, `MAX_LABEL_DISTANCE`, `LABEL_PARKED_VEHICLES`, `PARKED_VEHICLE_CLASS`, `MIN_TARGET_PIXELS`, `MIN_ROAD_FRACTION`, `SEG_TAGS` | labels.py, render.py, carla_io.py |
+| file names | `NAME_CODES` (short weather / scene codes in file names) | run.build_jobs |
 | run control | `MAX_RENDERS_PER_JOB`, `MAX_PLANS_PER_JOB`, `RELOAD_WORLD_EVERY`, `MAX_JOBS_PER_PROCESS`, `MAX_CRASHES_WITHOUT_PROGRESS`, `EXIT_*`, `STOP_WAIT_SECONDS` | run.py, supervisor.py |
-
-`SEQUENCE_MAX_SECONDS` is defined but **not used anywhere** (changing it has no effect).
 
 `COUNT_KEYS` = `("pedestrians", "vehicles", "cyclists", "trucks")`, the count keys of a weather row.
 
@@ -175,6 +199,7 @@ Exit codes the generator (child) returns to the supervisor:
 | `frames_per_job(scene)` | `SEQUENCE.frames` for occluded scenes (if enabled), else 1 |
 | `can_occlude(row)` | True if a weather row has occlusion > 0 and at least one car or truck |
 | `class_names()` | YOLO class list (adds `crossing_pedestrian` if `SPLIT_CROSSING_CLASS`) |
+| `short_name(name)` | weather / scene name as used in file names, from `NAME_CODES` ("occluded_by_parked" -> "occluded") |
 | `validate()` | checks config for mistakes; raises `ValueError` before anything runs |
 
 ---
@@ -186,13 +211,17 @@ All of these are plain dicts / lists, so they can be saved to JSON.
 **job** (made by `run.build_jobs`)
 
 ```
-{"name": "rain/occluded_by_parked/rain_occluded_by_parked_00012", "map": "Town10HD_Opt",
- "weather": "rain", "scene": "occluded_by_parked", "frames": 5, "block_index": 37}
+{"name": "rain_occluded_00061", "map": "Town10HD_Opt", "weather": "rain", "scene": "occluded_by_parked",
+ "frames": 5, "images": ["rain_occluded_00061", ..., "rain_occluded_00065"], "block_index": 37}
 ```
-`block_index` = place of the job inside its weather block (for weather re-sampling).
-The name is also where the job's files go: `images/rain/occluded_by_parked/rain_occluded_by_parked_00012_00.png`.
-The file name alone is unique; with `SAVE_IN_FOLDERS = False` the folders are dropped
-(`"rain_occluded_by_parked_00012"`). With more than one map the map comes first in both.
+`images` = the file names of its frames: a running number per short name (`NAME_CODES`),
+numbers in a row; scenes sharing a short name share the counter. The job's `name` is its
+first image (also the line in `jobs_done.txt`). No sub-folders. With more than one map a
+map code comes first: `"t03_rain_occluded_00061"`. `block_index` = place of the job inside
+its weather block (for weather re-sampling).
+
+Tests and `--self-test` add `"layout": {"lane": "ego" / "next", "cars": 1 / 2, "side":
+"left" / "right"}` to force one occluder layout; normal jobs pick it at random.
 
 **plan** (made by `planner.ScenePlanner.plan`)
 
@@ -202,8 +231,9 @@ The file name alone is unique; with `SAVE_IN_FOLDERS = False` the folders are dr
 | `signature` | site, lane, distance, weather, scene of this view (for reference) |
 | `counts` | the rolled pedestrians / vehicles / cyclists / trucks |
 | `occlusion_range`, `occlusion_peak` | the weather's (min, max) range, and the planned most-hidden share of the target's walk |
+| `layout` | `occluder_lane` (`ego` / `next` / `parked`, None if not occluded), `occluders` (how many), `turn` (`left` / `right` / None) |
 | `site` | `CrossingSite.to_json()`: id, kind, start, end, length, half_width |
-| `ego` | x, y, z, yaw, pitch, roll, lane, distance, approach |
+| `ego` | x, y, z, yaw, pitch, roll, camera_lift, lane, distance, approach (`same` / `opposite`, or `turn_left` / `turn_right`) |
 | `target_pedestrian` | index into `pedestrians` |
 | `frames` | list of `{"tick": t, "planned_occlusion": p}`; ticks counted from when people start walking |
 | `pedestrians` | list of pedestrian dicts (below) |
@@ -217,12 +247,15 @@ people `capture_progress`, `lateral_offset`.
 
 **vehicle** (made by `traffic.vehicle_dict`): `blueprint`, `category` (car/truck/cyclist),
 `role` (traffic/occluder), `color`, `x`, `y`, `z`, `yaw`, `pitch`, `direction`
-(same/oncoming), `long`, `lane`, and `parked: True` for a parked occluder.
+(same/oncoming), `long`, `lane`, `parked: True` for a parked occluder, and for occluders
+`occluder_lane` (`ego` / `next` / `parked`).
 
 **frame** (made by `render._finish_frame`, written by `labels.write_frame`): `rgb`,
-`seg` (class ids), `seg_color`, `depth_m` (metres), `labels`, `flags`, and `info` (goes
-into the JSON: map, job, scene, weather, planned / measured occlusion, flags, image
-size, classes, camera K and world_to_camera, the plan).
+`seg` (class ids), `seg_color`, `depth_m` (metres), `labels`, `flags`, `positions` (where
+every spawned walker / vehicle really was at that tick: kind, plan_index, center; not
+saved, used by `--self-test`), and `info` (goes into the JSON: map, job, scene, weather,
+planned / measured occlusion, flags, image size, classes, camera K and world_to_camera,
+the plan).
 
 **label** (made by `labels.compute_labels`): `kind` (pedestrian/vehicle/truck/cyclist, from
 CARLA's tags), `carla_class` (CARLA's own name: Pedestrian, Car, Truck, Bus, Motorcycle, Bicycle),
@@ -241,7 +274,7 @@ Functions starting with `_` are internal helpers of their file.
 
 | Function | What it does |
 |---|---|
-| `main()` | reads the command line and calls the right part: `--check`, `--delete-flagged`, `--summary`, `--cleanup`, the worker, or (no option) the supervisor |
+| `main()` | reads the command line and calls the right part: `--check`, `--delete-flagged`, `--summary`, `--cleanup`, `--self-test`, `--weather-preview`, the worker, or (no option) the supervisor |
 | `run_worker(args)` | runs `run.Generator`; turns Ctrl+C, a lost connection, or a server time-out into the exit codes the supervisor understands |
 
 ### engine/stop.py, clean stop
@@ -288,15 +321,14 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 | `forward_right(yaw_deg)` | unit forward and right vectors of a heading |
 | `heading_diff(a, b)` | smallest angle between two headings (0..180) |
 | `dot(a, b)`, `sub(a, b)` | 2D vector helpers |
-| `xy(loc)` | (x, y) of a location. **Not used anywhere** |
 | `step_along(wp, dist, forward)` | waypoint `dist` m ahead / behind on the same lane; at a junction takes the straightest branch |
 | `same_side(a, b)` | True if two lanes drive the same way (same lane-id sign) |
 | `_walk_outward(start)` | from a lane outward with `get_right_lane()`: the driving lanes and the first sidewalk |
 | `road_cross_section(wp)` | all driving lanes on both sides of the road at `wp` and the sidewalk on each side. Handles the CARLA quirk that "left" flips direction after the centre line |
 | `lane_key(wp)` | "road:section:lane" id of a lane |
 | `ground_z(carla_map, x, y, z_hint)` | road / sidewalk height at a point |
-| `CrossingSite` | one crossing place: start, end, centre, length, axis (start->end), along (road direction), half_width, road_wp. `to_json()` for saving |
-| `find_all_sites(carla_map, cfg)` | runs the three finders below, prints the counts, returns all sites |
+| `CrossingSite` | one crossing place: start, end, centre, length, axis (start->end), along (road direction), half_width, road_wp, and for turn sites `turns`. `to_json()` for saving |
+| `find_all_sites(carla_map, cfg)` | runs the four finders below, prints the counts, returns all sites |
 | `parse_crosswalk_polygons(carla_map)` | splits CARLA's flat crosswalk point list into polygons |
 | `_principal_axis(pts)` | long axis of a polygon and how elongated it is |
 | `_find_road_wp(carla_map, center, major, anisotropy)` | driving lane under a crosswalk whose road runs across it; prefers non-junction lanes |
@@ -306,18 +338,24 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 | `_far_from(x, y, centers, dist)` | point is at least `dist` from all given centres |
 | `find_road_sites(...)` | mid-block jaywalk sites: straight roads with sidewalks both sides, far from crosswalks, spaced apart |
 | `find_junction_sites(...)` | one site across each arm of every 3-way junction that has no crosswalk |
+| `TURN_STEP` | 0.5 m between the points of a turn path |
+| `_crosswalk_past(wp, crosswalk_sites, search)` | the marked crosswalk across wp's road just past a junction, or None |
+| `find_turn_sites(carla_map, crosswalk_sites, arm_offset, width_range, angle_range, far_offset)` | for every road leaving a junction that cars turn into (left or right, any junction): a site at the junction exit (its crosswalk, or a line `arm_offset` m in) and one `far_offset` m further in; `turns` = the junction lanes turning into it (start, end, side, entry road) |
+| `turn_path(start, end, back, ahead, step)` | points (x, y, z, yaw, waypoint) along one turn: from `back` m before the junction, along the junction lane, `ahead` m into the road turned into |
 
 ### engine/roads.py (end of file), planning camera
 
 | Function | What it does |
 |---|---|
 | `Frame(origin, yaw)`, `.local(x, y)` | road frame; turns world (x, y) into (long, lat) |
+| `footprint(frame, x, y, yaw, length, width)` | (long, lat, length, width) rectangle that holds a box turned by `yaw` |
 | `rects_overlap(a, b, gap_long, gap_lat)` | do two (long, lat, length, width) rectangles overlap, with gaps |
 | `PlanCamera(ego, z_offset)` | pinhole model of the dashcam at a planned ego pose |
-| `PlanCamera.box(corners)` | 2D box + mean depth of 3D corners, None if behind the camera |
+| `PlanCamera.box(corners)` | 2D box, mean depth and on-screen outline (convex polygon) of 3D corners, None if behind the camera |
+| `_hull(points)`, `_inside(poly, x, y)` | convex hull of 2D points; point inside a convex polygon |
 | `box_corners(x, y, z, yaw, l, w, h)` | 8 corners of a box standing on the ground |
 | `in_view(box)` | box is at least partly inside the image |
-| `coverage(target, occluders, samples)` | share of the target's box hidden by nearer occluder boxes (estimated on a grid) |
+| `coverage(target, occluders, samples)` | share of the target's box hidden by nearer occluders, using their real on-screen outline (a car seen at an angle hides less than its rectangle), estimated on a grid |
 
 ### engine/people.py, pedestrian planning
 
@@ -341,11 +379,14 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 | `SIZE` | planning length / width / height per category |
 | `vehicle_at(ctx, lane, s, drift)` | pose `s` m along the road frame on `lane`, shifted `drift` m to the lane's right |
 | `vehicle_dict(ctx, category, wp, x, y, direction, role)` | builds a vehicle dict (picks model and colour) |
-| `boxes_of(ctx, v)`, `rect_of(ctx, v)` | planning-camera silhouette boxes (a car = low body + middle cabin; truck / cyclist = one block) / road-frame rectangle of a vehicle |
+| `boxes_of(ctx, v)`, `rect_of(ctx, v)` | planning-camera silhouette boxes (a car = low body + middle cabin; truck / cyclist = one block) / road-frame rectangle of a vehicle (turned cars included) |
 | `max_drift(direction, lane, width)` | how far a vehicle may sit off its lane centre (2.4 m ego-lane rule for same-direction traffic) |
 | `_direction_of`, `_lanes_by_direction` | lanes for "same" / "oncoming" traffic |
-| `place_traffic(ctx, category, protect_boxes)` | one normal car / truck / cyclist: before or past the crossing, never on it, never overlapping, never hiding the target |
-| `adjacent_occluders(ctx, categories, ped_long, rects)` | 1-2 cars in the lane next to the ego, before the pedestrian's path |
+| `place_traffic(ctx, category, protect_boxes)` | one normal car / truck / cyclist: before or past the crossing, never on it, never overlapping, never hiding the target (in a turn scene only past the crossing: before it is the junction) |
+| `_occluder_lane(ctx, have_own, have_next)` | `ego` or `next` by `OCCLUDER_SAME_LANE_CHANCE` (or the job's layout), falling back to the one that exists |
+| `_check_occluder(ctx, v, ped_long, rects, placed_rects)` | an occluder's rectangle, or None if it reaches the pedestrian's path or hits something |
+| `lane_occluders(ctx, categories, ped_long, rects)` | 1-2 cars before the pedestrian's path, right in front of the ego (`SAME_LANE_GAP`) or in the lane next to it (`ADJACENT_CARS_AHEAD`) |
+| `turning_occluders(ctx, categories, ped_long, rects)` | 1-2 cars ahead of the turning ego on its turn path (or a turn lane beside it), queuing `TURN_CAR_GAP` apart |
 | `parked_occluder(ctx, category, ped_long, rects)` | a car pulled over at the curb, its front just before the pedestrian's path |
 
 ### engine/occlusion.py, occluded walk
@@ -354,11 +395,13 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 |---|---|
 | `STEP` | 0.1 m between predicted positions |
 | `EXTEND`, `CLEAR_VIEW` | the walk may go 3 m onto each sidewalk; frames start / end 0.8 m into the visible part |
-| `_occluder_categories(ctx, scene, cars, trucks)` | whether the occluder(s) are cars or a truck (from the job's own counts) |
+| `_occluder_categories(ctx, scene, cars, trucks)` | how many occluders and whether cars or a truck (from the job's counts, or the forced layout); None if the layout's cars are not available |
+| `_well_in_view(box, keep)` | at least 80 % of the pedestrian's on-screen box is inside the image: only then a frame can count as "visible" |
+| `_may_hide(ctx, probe, walk, boxes)` | quick test before the curve: can any occluder be in front of some part of the walk at all? |
 | `_walk(ctx, direction, lateral)` | positions every 10 cm along the walk, from one sidewalk to the other |
 | `_arcs(curve, lo, hi)` | stretches of the walk "visible -> hidden -> visible" whose most hidden point is in [lo, hi] |
-| `_frame_indices(start, peak, end, n)` | `n` frames spread over that stretch, one exactly at the most hidden point |
-| `plan_occluded(ctx, scene, occ_range, cars, trucks, n_frames)` | tries up to 40 layouts (occluders + a walk across the road, random direction); keeps a walk that goes visible -> hidden -> visible with its most hidden moment closest to a random goal inside `occ_range`; returns target pedestrian, occluders, frame ticks, occupied space, planned peak |
+| `_frame_indices(start, peak, end, n)` | `n` frames spread over that stretch; the middle frame nearest the most hidden point moves onto it (first and last stay visible) |
+| `plan_occluded(ctx, scene, occ_range, cars, trucks, n_frames)` | tries up to 40 layouts (occluders for the scene: `lane_occluders`, `parked_occluder` or `turning_occluders`, + a walk across the road, random direction); keeps a walk that goes visible -> hidden -> visible with its most hidden moment closest to a random goal inside `occ_range`; returns target pedestrian, occluders, frame ticks, occupied space, planned peak |
 
 ### engine/planner.py, whole scene plan
 
@@ -366,7 +409,7 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 |---|---|
 | `PlanError` | raised when a plan fails a check; the job loop just tries the next seed |
 | `CATEGORY_KEY` | car -> vehicles, truck -> trucks, cyclist -> cyclists |
-| `SceneContext` | bag of everything the helpers need (rng, site, ego, lanes, frame, camera, occupied rectangles, models) |
+| `SceneContext` | bag of everything the helpers need (rng, site, ego, lanes, frame, camera, occupied rectangles, models, the job's `layout`, and `turn` for a turn scene) |
 | `ScenePlanner(...)` | made once per map with its sites, parked map cars, pedestrian and vehicle models |
 | `.register(plan)` | counts a saved plan: spot use per weather, and its view (lane, distance) |
 | `._view_is_new(site, weather, ego)` | False if the same lane at this spot (same weather) was used within `MIN_VIEW_DISTANCE_GAP` m |
@@ -374,7 +417,9 @@ Runs on the map's OpenDRIVE data on our side, no server calls.
 | `.cross_section(site)` | cached `road_cross_section` of a site |
 | `._env_rects(frame)` | the map's parked cars as road-frame rectangles |
 | `.plan_ego(rng, site, distance_range)` | ego pose: lane, distance, heading jitter, camera lift + tilt (the ego is raised / tilted; the camera is fixed to it); checks the crossing is ahead and in view |
-| `.plan(rng, job, params)` | the full plan in order: counts -> site -> ego -> new-view check -> target (+ occluders) -> other people -> traffic -> sidewalk people |
+| `.turn_paths(site)` | every turn into a turn site's road as a `roads.turn_path` (cached) |
+| `.plan_turn_ego(rng, site, side)` | ego on a left / right turn into the site's road, at a point where the crossing is ahead, `TURN_EGO_DISTANCE_RANGE` away and within `TURN_VIEW_BEARING_DEG`; returns the ego and the turn (side, path, ego's place on it, parallel turn lanes) |
+| `.plan(rng, job, params)` | the full plan in order: counts -> site -> ego (`plan_turn_ego` for `occluded_turning`) -> new-view check -> target (+ occluders) -> other people -> traffic -> sidewalk people |
 
 ### engine/carla_io.py, talking to CARLA
 
@@ -405,7 +450,7 @@ Session part, `MapSession` (one per map):
 | `open(reload)` | loads the map, cleans it, finds sites, reads parked map cars, builds the planner, spawns the ego |
 | `_load(reload)` | switches map (or reloads it) and turns sync mode on |
 | `_set_sync(on)` | sync mode on / off |
-| `_spawn_ego()` | finds 3 ego poses, spawns ego + cameras, measures the car-bonnet mask from those poses |
+| `_spawn_ego()` | finds 3 ego poses (not at turn sites), spawns ego + cameras, measures the car-bonnet mask from those poses |
 | `close(why)` | removes everything and switches back to async mode, even if Ctrl+C is pressed again |
 | `reload()` | `close` + full world reload (clears server-side leftovers) |
 | `set_weather(name, key, rng)` | applies a new look of a weather only when `key` changes |
@@ -419,8 +464,8 @@ Session part, `MapSession` (one per map):
 |---|---|
 | `KIND` | plan category -> label kind |
 | `render_job(session, plan)` | moves the ego, spawns and freezes traffic, spawns people and starts them walking, captures every planned frame (plus the "traffic hidden" segmentation), always removes what it spawned |
-| `_finish_frame(...)` | from raw images to a frame dict: labels, flags, RGB downscale, colour segmentation, depth, JSON info |
-| `scene_objects(session, plan, walkers, vehicles, cam_tf)` | everything that may get a label, with its 3D box and meta (crossing progress, walking direction, ...) |
+| `_finish_frame(...)` | from raw images to a frame dict: labels, flags, RGB downscale, colour segmentation, depth, actor positions, JSON info |
+| `scene_objects(session, plan, walkers, vehicles, cam_tf)` | everything that may get a label, with its 3D box and meta (crossing progress, walking direction, ...); its inner `box_obj` turns one actor into such an object |
 
 ### engine/labels.py, labels, checks, saving
 
@@ -436,7 +481,7 @@ Session part, `MapSession` (one per map):
 | `_assign_pixels(objs, masks, depth, w, h)` | nearest object first takes the pixels in its box whose tag fits **and** whose depth matches its own distance |
 | `_carla_class(seg, pix)` | most common CARLA tag on an object's pixels -> (our class, CARLA name); a rider counts with its bicycle / motorcycle |
 | `_big_enough(box, pixels, kind)` | enough pixels and big enough box to label |
-| `compute_labels(objects, seg, seg_full, hood, world_to_cam, K, depth, depth_full)` | all labels of a frame; `seg_full` (traffic hidden) gives full-body boxes and real occlusion |
+| `compute_labels(objects, seg, seg_full, hood, world_to_cam, K, depth, depth_full)` | all labels of a frame; `seg_full` (traffic hidden) gives full-body boxes and real occlusion. In that pass only pedestrians take pixels: the moved-away car must not take the pixels of the person behind it |
 | `road_fraction(seg, hood)` | share of road-like pixels (camera-blocked check) |
 | `hood_mask(seg_frames)` | the ego's bonnet pixels at the bottom of the image |
 | `target_label(labels)` | the target pedestrian's label |
@@ -468,16 +513,42 @@ Generator part:
 | `scenes_for(weather, available_kinds)` | scene types this weather can have on this map |
 | `resolve_maps(wanted, available)` | `MAPS` entries -> (short name, path to load); short name or full path, any case |
 | `spot_shortages(planner, jobs)` | weather/scene combinations asking for more jobs than spots x `MAX_USES_PER_SPOT` (warned at start) |
-| `build_jobs(map_name, map_index, n_maps, available_kinds)` | the ordered job list: weather blocks, scene types inside; job names are folder paths |
+| `map_codes(names)` | short map codes for file names (Town03_Opt -> t03, a custom map keeps its name) |
+| `build_jobs(map_name, map_index, n_maps, available_kinds, map_code)` | the ordered job list: weather blocks, scene types inside; every frame gets its file name (running number per short name) |
 | `Generator(out)` | output folders, progress |
 | `.run(plan_only)` | the whole run (section 1) |
-| `._register_done(session, jobs)` | feeds finished jobs to the planner (spot use, views) |
+| `._register_done(session, jobs)` | feeds finished jobs to the planner (spot use, views), from the first saved frame's JSON |
 | `._weather(session, job)` | sets the weather for the job's block |
 | `._params(job, rng)` | the weather row used for this job's counts |
 | `.run_job(session, job)` | plan -> render -> save, retrying until a good one or the limits |
 | `._save(job, frames)` | writes frames, records flags, prints progress |
 | `.plan_only(session, jobs, per_scene)` | `--plan-only`: plans without rendering and prints rejection reasons |
 | `.log(text)`, `.write_dataset_yaml()` | `run_log.txt`, `data.yaml` |
+
+### engine/selftest.py, --self-test
+
+| Function | What it does |
+|---|---|
+| `LAYOUTS` | every occluder layout: (name, scene, layout); also used by the tests |
+| `PARAMS` | counts used for the test scenes (1 pedestrian, 2 cars, occlusion 50-95 %) |
+| `WALKER_TOLERANCE`, `VEHICLE_TOLERANCE`, `VISIBLE_MAX`, `HIDDEN_MIN` | how far off a position may be; how hidden a visible / the most hidden frame may / must be |
+| `plan_layout(planner, scene, layout, weather, key, tries)` | a plan with exactly that layout, or None |
+| `check(plan, frames)` | the measured occlusion per frame and the problems: actors away from their planned spots, not visible -> hidden -> visible, wrong CARLA class |
+| `run_self_test(out, per_layout)` | connects, opens the first map in `MAPS`, renders `per_layout` scenes of every layout, saves the frames with boxes to `<out>/self_test/`, prints ok / FAIL / skip; exit code 0 if nothing failed |
+
+### engine/weather_preview.py, --weather-preview
+
+| Function | What it does |
+|---|---|
+| `LEVELS`, `ROWS` | the levels (0..100) and the rows: which settings each row turns up |
+| `WEATHER_KEYS`, `SUN` | settings put to 0 for every picture; the fixed high sun |
+| `EXPOSURES`, `EXPOSURE_SKY` | camera brightness values of the last row, and its cloudy sky |
+| `SETTLE_TICKS`, `CELL_W`, `CELL_H`, `LABEL_W`, `HEADER_H` | ticks before a picture; sheet layout |
+| `_scene(session)` | plans a crossing with 3 people and a car, like a clear-weather job |
+| `_weather(session, values)` | sets the weather: those values, everything else 0, sun high |
+| `_photo(session, cam)` | one RGB picture at output size |
+| `_text(img, text, x, y, scale)`, `_sheet(rows)` | white text with a dark outline; all pictures in one labelled grid |
+| `run_weather_preview(out)` | connects, builds the scene, takes every row, writes `<out>/weather_preview/sheet.jpg` and the single pictures, empties the world |
 
 ---
 
@@ -490,7 +561,10 @@ Generator part:
 | change frames per occluded walk | `SEQUENCE["frames"]`; spread by `occlusion._frame_indices` |
 | change how hidden the pedestrian gets | `occlusion` (min, max) per weather in config.py |
 | make the reveal faster / slower | `SEQUENCE["walk_speed"]` |
-| change where occluding cars stand | `ADJACENT_CARS_AHEAD`, `PARKED_NOSE_GAP`; logic in `traffic.adjacent_occluders` / `parked_occluder` |
+| change where occluding cars stand | `SAME_LANE_GAP`, `ADJACENT_CARS_AHEAD`, `PARKED_NOSE_GAP`, `TURN_CAR_GAP`; logic in `traffic.lane_occluders` / `parked_occluder` / `turning_occluders` |
+| more / fewer cars right in front of the ego | `OCCLUDER_SAME_LANE_CHANCE` (1 = always the ego's lane, 0 = always the next lane) |
+| change the turning scenes | `TURN_*` settings; ego pose in `planner.plan_turn_ego`, crossing lines in `roads.find_turn_sites` |
+| add an occluder layout | its placement in traffic.py, call it in `occlusion.plan_occluded`, add it to `selftest.LAYOUTS` (the tests and `--self-test` then check it) |
 | add a new scene type | 1) `SCENES` in config.py, 2) `SCENE_SITE_KINDS` (and `OCCLUDED_SCENES` if occluded) in advanced.py, 3) its behaviour in `planner.ScenePlanner.plan` |
 | add a new kind of crossing place | a finder in roads.py returning `CrossingSite(..., kind="mykind", ...)`, call it in `find_all_sites`, use the kind in `SCENE_SITE_KINDS` |
 | change camera height / angle / lens | `CAMERA_LOCATION`, `CAMERA_PITCH`, `CAMERA_FOV` (labels follow automatically) |
@@ -502,6 +576,7 @@ Generator part:
 | change when an image is flagged | `labels.frame_flags` and its thresholds (`OCCLUSION_TOLERANCE`, `MIN_TARGET_PIXELS`, `MIN_ROAD_FRACTION`) |
 | change what is saved | `SAVE` in config.py; a new output: add a flag + folder in `OUTPUT_FOLDERS` and write it in `labels.write_frame` |
 | change box drawing | `BOX_COLOR`, `BOX_THICKNESS`; code in `labels.draw_2d` / `draw_3d` |
+| choose weather ranges | `python main.py --weather-preview`, then `WEATHER_LOOK`; rows / levels in `weather_preview.ROWS` / `LEVELS` |
 | more variety | add maps to `MAPS`; lower `MAX_USES_PER_SPOT`; raise `MIN_VIEW_DISTANCE_GAP`; widen `EGO_DISTANCE_RANGE`, `CAMERA_LIFT_RANGE`, `CAMERA_PITCH_JITTER_DEG` |
 | use a custom map | add its name or path to `MAPS`; check with `python main.py --check` |
 
@@ -540,3 +615,24 @@ Generator part:
 | why one image looks the way it does | `labels_3d/<image>.json` -> `plan` (every position) and `seed_key` |
 | CARLA left frozen / full of actors | `python main.py --cleanup` |
 | quick test | `python main.py --out /tmp/test` with small `images` values in config.py |
+| occluded scenes look wrong in CARLA | `python main.py --self-test`, then the frames in `dataset/self_test/` |
+| you changed the code | `python -m unittest discover -s tests` from `Dataset_Generation` (section 10) |
+
+---
+
+## 10. Tests
+
+`tests/` runs without CARLA: `python -m unittest discover -s tests` from the
+`Dataset_Generation` folder (about 2 minutes; add `-v` to see every check).
+
+| File | What it is |
+|---|---|
+| `fake/carla.py` | a small stand-in for the `carla` module: map "FakeCity" (a 4-way junction with turn lanes, 4 roads with 2 lanes each way, sidewalks, 3 crosswalks), a simulator that moves walkers by their `WalkerControl`, and cameras that draw segmentation / depth from the actors' shapes (a car = low body + cabin, like a real one). Found before a real `carla` because `helpers.py` puts it first on the path |
+| `helpers.py` | `configure()` (fixed test settings, independent of your config.py), `make_planner()`, `plan_layout()`, `open_session()`, and 3D sight-line geometry (`camera_xyz`, `segment_hits_box`, `vehicle_solids`, `hidden_share`) that checks occlusion without the planner's camera model |
+| `test_layouts.py` | every layout on the plan: lane, order ego -> car(s) -> pedestrian, visible -> hidden -> visible, sight lines really blocked |
+| `test_render.py` | every layout through `MapSession` + `render_job`: positions at every frame, rendered occlusion, classes |
+| `test_labels.py` | label measurement on hand-made images |
+| `test_names.py`, `test_run.py`, `test_variety.py`, `test_stop.py`, `test_selftest.py`, `test_weather_preview.py` | file names; a full small run (files, resume, flagged / skipped); variety; clean stop; `--self-test`; `--weather-preview` |
+
+A new test: a `test_*.py` file in `tests/` with a `unittest.TestCase`; start it with
+`import helpers as H` and call `H.configure()` in `setUp` / `setUpClass`.

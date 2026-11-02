@@ -1,11 +1,13 @@
 """Places cars, trucks and cyclists for a scene (as plan data, nothing is spawned).
 
 Normal traffic   : any lane, same way as the ego or oncoming, before or past the crossing.
-Adjacent cars    : 1-2 cars in the lane next to the ego, between ego and crossing (occluders).
+Cars ahead       : 1-2 cars between ego and crossing, right in front of the ego (its own
+                   lane) or in the lane next to it (occluders).
+Turning cars     : 1-2 cars ahead of the turning ego on its turn path (occluders).
 Parked car       : a car at the curb right before the pedestrian's path (occluder).
 """
 import advanced as C
-from engine.roads import box_corners, coverage, dot, forward_right, lane_key, rects_overlap, step_along
+from engine.roads import TURN_STEP, box_corners, coverage, dot, footprint, forward_right, lane_key, rects_overlap, step_along
 
 
 SIZE = {"car": C.CAR_SIZE, "truck": C.TRUCK_SIZE, "cyclist": C.CYCLIST_SIZE}
@@ -52,8 +54,7 @@ def boxes_of(ctx, v):
 
 def rect_of(ctx, v):
     length, width, _ = SIZE[v["category"]]
-    lo, la = ctx.frame.local(v["x"], v["y"])
-    return (lo, la, length, width)
+    return footprint(ctx.frame, v["x"], v["y"], v["yaw"], length, width)
 
 
 def max_drift(direction, lane, width):
@@ -91,7 +92,8 @@ def place_traffic(ctx, category, protect_boxes):
         lane = ctx.rng.choice(lanes)
         direction = _direction_of(ctx, group)
         in_ego_lane = lane_key(lane) == ctx.ego["lane"]
-        near_ok = (category == "cyclist" or not in_ego_lane) and near_lo < -corridor
+        # turning ego: the part of the road before the crossing is the junction, keep it free
+        near_ok = (category == "cyclist" or not in_ego_lane) and near_lo < -corridor and not ctx.turn
         if near_ok and ctx.rng.random() < C.NEAR_SIDE_PROBABILITY:
             s = ctx.rng.uniform(near_lo, -corridor)
         elif corridor < C.TRAFFIC_FAR_MAX:
@@ -125,41 +127,101 @@ def place_traffic(ctx, category, protect_boxes):
 
 # ---------- occluders ----------
 
-def adjacent_occluders(ctx, categories, ped_long, rects):
-    """Cars in a lane right next to the ego, between ego and the pedestrian's path."""
+def _occluder_lane(ctx, have_own, have_next):
+    """'ego' (cars right in front of the ego) or 'next' (the lane beside it), or None.
+    A layout given for the job (tests, --self-test) is used as it is."""
+    want = ctx.layout.get("lane")
+    if want:
+        return want if {"ego": have_own, "next": have_next}[want] else None
+    want = "ego" if ctx.rng.random() < C.OCCLUDER_SAME_LANE_CHANCE else "next"
+    if not {"ego": have_own, "next": have_next}[want]:
+        want = "next" if want == "ego" else "ego"
+    return want if {"ego": have_own, "next": have_next}[want] else None
+
+
+def _check_occluder(ctx, v, ped_long, rects, placed_rects):
+    """Rectangle of an occluder, or None if it reaches the pedestrian's path or hits something."""
+    rect = rect_of(ctx, v)
+    if rect[0] + rect[2] / 2 > ped_long - 0.8:
+        return None                 # no room before the pedestrian's path
+    if any(rects_overlap(rect, r, C.VEHICLE_GAP, 0.3) for r in rects + placed_rects):
+        return None
+    return rect
+
+
+def lane_occluders(ctx, categories, ped_long, rects):
+    """1-2 cars between the ego and the pedestrian's path: right in front of the ego
+    (ego -> car -> car -> pedestrian) or in the lane next to it."""
     ego_lo, ego_la = ctx.frame.local(ctx.ego["x"], ctx.ego["y"])
-    lanes = []
+    own, beside = [], []
     for group in ("same", "opposite"):
         for lane in ctx.xs[group]:
             lo, la = ctx.frame.local(lane.transform.location.x, lane.transform.location.y)
-            if 2.3 < abs(la - ego_la) < 4.8:
-                lanes.append((lane, group))
-    if not lanes:
+            if abs(la - ego_la) < 1.5 and group == ctx.ego_group:
+                own.append((lane, group))
+            elif 2.3 < abs(la - ego_la) < 4.8:
+                beside.append((lane, group))
+    which = _occluder_lane(ctx, bool(own), bool(beside))
+    if which is None:
         return None
-    lane, group = ctx.rng.choice(lanes)
+    lane, group = ctx.rng.choice(own if which == "ego" else beside)
     direction = _direction_of(ctx, group)
 
     out, placed_rects = [], []
-    s = ego_lo + ctx.rng.uniform(*C.ADJACENT_CARS_AHEAD)
+    if which == "ego":              # first car's rear this far ahead of the ego's centre
+        s = ego_lo + C.EGO_SIZE[0] / 2 + ctx.rng.uniform(*C.SAME_LANE_GAP)
+    else:
+        s = ego_lo + ctx.rng.uniform(*C.ADJACENT_CARS_AHEAD)
     for category in categories:
         length, width, _ = SIZE[category]
         s += length / 2
         if s + length / 2 > ped_long - 0.8:
-            return None             # no room before the pedestrian's path
+            return None
         m = max_drift(direction, lane, width)
         placed = vehicle_at(ctx, lane, s, ctx.rng.uniform(-m, m))
         if placed is None:
             return None
         wp, x, y = placed
         v = vehicle_dict(ctx, category, wp, x, y, direction, "occluder")
-        rect = rect_of(ctx, v)
-        if rect[0] + length / 2 > ped_long - 0.8:
-            return None
-        if any(rects_overlap(rect, r, C.VEHICLE_GAP, 0.3) for r in rects + placed_rects):
+        v["occluder_lane"] = which
+        rect = _check_occluder(ctx, v, ped_long, rects, placed_rects)
+        if rect is None:
             return None
         out.append(v)
         placed_rects.append(rect)
         s += length / 2 + ctx.rng.uniform(1.5, 4.0)
+    return out, placed_rects
+
+
+def turning_occluders(ctx, categories, ped_long, rects):
+    """1-2 cars ahead of the turning ego, turning the same way: on its own turn path,
+    or on a turn lane right next to it (wide junctions turn with 2 lanes)."""
+    turn = ctx.turn
+    which = _occluder_lane(ctx, True, bool(turn["parallel"]))
+    if which is None:
+        return None
+    path = turn["path"] if which == "ego" else ctx.rng.choice(turn["parallel"])
+    ex, ey = ctx.ego["x"], ctx.ego["y"]
+    i0 = min(range(len(path)), key=lambda i: (path[i][0] - ex) ** 2 + (path[i][1] - ey) ** 2)
+    s = i0 * TURN_STEP + (C.EGO_SIZE[0] / 2 + ctx.rng.uniform(*C.SAME_LANE_GAP) if which == "ego"
+                          else ctx.rng.uniform(*C.ADJACENT_CARS_AHEAD))
+
+    out, placed_rects = [], []
+    for category in categories:
+        length = SIZE[category][0]
+        s += length / 2
+        i = int(round(s / TURN_STEP))
+        if i >= len(path):
+            return None
+        x, y, _, _, wp = path[i]
+        v = vehicle_dict(ctx, category, wp, x, y, "same", "occluder")
+        v["occluder_lane"] = which
+        rect = _check_occluder(ctx, v, ped_long, rects, placed_rects)
+        if rect is None:
+            return None
+        out.append(v)
+        placed_rects.append(rect)
+        s += length / 2 + ctx.rng.uniform(*C.TURN_CAR_GAP)      # cars queue close together through a turn
     return out, placed_rects
 
 
@@ -183,6 +245,7 @@ def parked_occluder(ctx, category, ped_long, rects):
     wp, x, y = placed
     v = vehicle_dict(ctx, category, wp, x, y, _direction_of(ctx, group), "occluder")
     v["parked"] = True
+    v["occluder_lane"] = "parked"
     rect = rect_of(ctx, v)
     if abs(rect[0] - target_long) > 1.0 or rect[0] + length / 2 > ped_long - 0.3:
         return None

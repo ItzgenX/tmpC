@@ -43,13 +43,14 @@ PED_TYPE_OVERRIDES = {}             # blueprint id -> "child"/"woman"/"man", if 
 PED_BLUEPRINT_EXCLUDE = []
 
 # --- scene types ---
-OCCLUDED_SCENES = ("occluded_by_traffic", "occluded_by_parked")
+OCCLUDED_SCENES = ("occluded_by_traffic", "occluded_by_parked", "occluded_turning")
 SCENE_SITE_KINDS = {                # where each scene type may happen
     "crosswalk": ["crosswalk"],
     "jaywalk_road": ["road"],
     "jaywalk_junction": ["junction"],
     "occluded_by_traffic": ["crosswalk", "road", "junction"],
     "occluded_by_parked": ["road", "junction"],     # nobody parks on a marked crosswalk
+    "occluded_turning": ["turn"],                   # the road a car turns into at a junction
 }
 
 # --- occlusion ---
@@ -60,9 +61,18 @@ OCCLUDER_TRUCK_CHANCE = 0.3         # when trucks are available, chance the occl
 OCCLUDED_EGO_DISTANCE_RANGE = (12.0, 35.0)
 ADJACENT_CARS_AHEAD = (1.0, 25.0)   # occluding cars next to the ego: metres ahead of the ego
 PARKED_NOSE_GAP = (0.5, 6.0)        # gap between parked car's front and the pedestrian's path
-SEQUENCE_MAX_SECONDS = 15.0         # longest walk to cover all frames of a sequence
+OCCLUDER_SAME_LANE_CHANCE = 0.5     # occluding cars right in front of the ego (its own lane), else the lane next to it
+SAME_LANE_GAP = (2.0, 12.0)         # metres from the ego's front bumper to the first car in its own lane
 FULLY_VISIBLE = 0.03                # "completely visible" = at most this much hidden
 PROTECT_TARGET_MAX_COVER = 0.05     # non-occluder traffic may cover at most this much of the target
+
+# --- turning at a junction (occluded_turning) ---
+TURN_ANGLE_RANGE = (60.0, 120.0)    # heading change that counts as a left / right turn
+TURN_EGO_DISTANCE_RANGE = (8.0, 35.0)   # ego to crossing centre while turning
+TURN_VIEW_BEARING_DEG = 40.0        # the crossing is at most this far off the ego's heading (camera sees +-45)
+TURN_CAR_GAP = (1.0, 4.0)           # gap between 2 cars queuing through a turn (ego -> first car: SAME_LANE_GAP)
+TURN_FAR_CROSSING = 12.0            # 2nd crossing line this far into the road turned into (besides the one at the junction)
+TURN_PATH_BACK = 25.0               # a turn starts this far before the junction (ego / cars may be there)
 
 # --- crossing sites ---
 JAYWALK_MIN_DIST_FROM_CROSSWALK = 30.0
@@ -126,6 +136,7 @@ LABEL_PARKED_VEHICLES = True        # the map's own parked cars
 PARKED_VEHICLE_CLASS = {"Car": "vehicle", "Truck": "truck", "Bus": "truck"}
 MIN_TARGET_PIXELS = 300             # target pedestrian (unoccluded silhouette) must be at least this big
 MIN_ROAD_FRACTION = 0.12            # below this the camera is probably blocked
+# tag numbers: https://carla.readthedocs.io/en/0.9.16/ref_sensors/#semantic-segmentation-camera
 SEG_TAGS = {                        # CARLA >= 0.9.14
     "pedestrian": [12],
     "vehicle": [14, 15, 16],        # car, truck, bus (used for the ego bonnet mask)
@@ -138,6 +149,18 @@ TAG_NAMES = {12: "Pedestrian", 13: "Rider", 14: "Car", 15: "Truck", 16: "Bus",
              18: "Motorcycle", 19: "Bicycle"}
 RIDER_TAG = 13                      # a rider counts with the bicycle / motorcycle it sits on
 DEPTH_MATCH_MARGIN = 0.75           # a pixel belongs to an object if its depth is within the object's box +- this (m)
+
+# --- file names ---
+# every output folder is flat: images/rain_occluded_00012.png = weather, scene, running
+# number (with several maps the map comes first: t03_rain_occluded_00012.png). The number
+# counts up from 00001 for each name, so scenes sharing a short name never clash; the
+# 5 images of one occluded walk are 5 numbers in a row.
+# Short names; anything not listed keeps its own name ("_" -> "-").
+NAME_CODES = {
+    "partly_cloudy": "cloudy", "snowfall": "snow",
+    "jaywalk_road": "jaywalk", "jaywalk_junction": "junction",
+    "occluded_by_traffic": "occluded", "occluded_by_parked": "occluded", "occluded_turning": "occluded",
+}
 
 # --- run control ---
 MAX_RENDERS_PER_JOB = 6             # renders that crash / fail to spawn before a job is skipped
@@ -197,6 +220,11 @@ def class_names():
     if SPLIT_CROSSING_CLASS:
         names = ["crossing_pedestrian"] + names
     return names
+
+
+def short_name(name):
+    """Weather / scene name as used in file names: "occluded_by_parked" -> "occluded"."""
+    return NAME_CODES.get(name, name).replace("_", "-")
 
 
 def validate():
