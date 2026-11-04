@@ -1,9 +1,14 @@
 """python main.py --weather-preview: one picture sheet that shows what each weather setting does.
 
-Every row changes one setting from 0 to 100 (everything else 0, sun high), on the same
-street view with people standing on the crossing, so you can see how strong a value looks
-and pick the (min, max) ranges of WEATHER_LOOK in advanced.py. The last rows show the
-rain settings together, and the camera brightness (exposure_compensation) on a cloudy day.
+Three sections, all on the same street view with people standing on the crossing:
+  1. single settings  - each one alone, 0/25/50/75/100, everything else 0 (sun high).
+  2. WEATHER_LOOK      - your three conditions from advanced.py, ALL their parameters
+                         combined, at the low / mid / high of each one's range. This is
+                         what clear / partly_cloudy / overcast will actually look like.
+  3. COMBOS below      - your own hand-picked combinations, to test a specific mix before
+                         putting it in advanced.py.
+The exact numbers behind every picture are printed to the console and written to
+<out>/weather_preview/values.txt, so you can read off exactly what produced a look you like.
 Saved to <out>/weather_preview/: sheet.jpg, plus every picture full size.
 Settings: https://carla.readthedocs.io/en/0.9.16/python_api/#carla.WeatherParameters
 """
@@ -30,6 +35,16 @@ ROWS = [                                    # (row name, settings set to the lev
     ("rain: all 4\n+ cloudiness", ["cloudiness", "precipitation", "precipitation_deposits", "wetness"]),
 ]
 WEATHER_KEYS = ("cloudiness", "precipitation", "precipitation_deposits", "wind_intensity", "fog_density", "wetness")
+LOOK_POINTS = (0.0, 0.5, 1.0)                # fraction of each WEATHER_LOOK range: low / mid / high
+LOOK_LABELS = ("low", "mid", "high")
+# --- your own test mixes: edit freely, each one renders as one picture ---
+# values left out default to 0. try a guess here before writing it into advanced.WEATHER_LOOK.
+COMBOS = [
+    ("light haze",     {"cloudiness": 20, "fog_density": 5, "wind_intensity": 10}),
+    ("heavy overcast", {"cloudiness": 95, "fog_density": 6, "wind_intensity": 25}),
+    ("drizzle",        {"cloudiness": 70, "precipitation": 30, "precipitation_deposits": 20,
+                         "wetness": 30, "wind_intensity": 15}),
+]
 SUN = {"sun_altitude_angle": 70.0, "sun_azimuth_angle": 45.0}
 # camera brightness: 0 = as measured, -1 = 2x darker, +1 = 2x brighter (CARLA's Linux default is -1.5)
 # https://carla.readthedocs.io/en/0.9.16/ref_sensors/#rgb-camera
@@ -58,6 +73,21 @@ def _weather(session, values):
     for k, v in {**{k: 0.0 for k in WEATHER_KEYS}, **SUN, **values}.items():
         setattr(w, k, float(v))
     session.world.set_weather(w)
+
+
+def _values_label(values):
+    return " ".join(f"{k}={v:g}" for k, v in sorted(values.items()))
+
+
+def _look_rows():
+    """advanced.WEATHER_LOOK, every parameter in a condition combined, at low/mid/high of its range."""
+    rows = []
+    for cond, ranges in C.WEATHER_LOOK.items():
+        cells = []
+        for t, label in zip(LOOK_POINTS, LOOK_LABELS):
+            cells.append((label, {k: lo + (hi - lo) * t for k, (lo, hi) in ranges.items()}))
+        rows.append((cond, cells))
+    return rows
 
 
 def _photo(session, cam):
@@ -99,7 +129,7 @@ def run_weather_preview(out):
     folder = os.path.join(out, "weather_preview")
     os.makedirs(folder, exist_ok=True)
 
-    session, actors, rows = MapSession(client, carla, *maps[0]), [], []
+    session, actors, rows, legend = MapSession(client, carla, *maps[0]), [], [], []
     try:
         session.open()
         plan = _scene(session)
@@ -122,6 +152,32 @@ def run_weather_preview(out):
             rows.append((name, cells))
             print(f"  {name}: done")
 
+        for cond, cells in _look_rows():
+            rendered = []
+            for label, values in cells:
+                _weather(session, values)
+                img = _photo(session, session.rgb)
+                fname = f"look_{cond}_{label}.jpg"
+                cv2.imwrite(os.path.join(folder, fname), img)
+                rendered.append((label, img))
+                line = f"{fname}: {_values_label(values)}"
+                legend.append(line)
+                print(f"  {line}")
+            rows.append((f"WEATHER_LOOK\n{cond}", rendered))
+
+        if COMBOS:
+            cells = []
+            for name, values in COMBOS:
+                _weather(session, values)
+                img = _photo(session, session.rgb)
+                fname = f"combo_{name.replace(' ', '_')}.jpg"
+                cv2.imwrite(os.path.join(folder, fname), img)
+                cells.append((name, img))
+                line = f"{fname}: {_values_label(values)}"
+                legend.append(line)
+                print(f"  {line}")
+            rows.append(("your COMBOS\n(edit in this file)", cells))
+
         _weather(session, EXPOSURE_SKY)
         cells = []
         for e in EXPOSURES:                 # brightness can only be set when a camera is made
@@ -142,7 +198,13 @@ def run_weather_preview(out):
             destroy_actors(session.client, session.world, actors)
         session.close()
 
+    if legend:
+        with open(os.path.join(folder, "values.txt"), "w") as f:
+            f.write("\n".join(legend) + "\n")
+
     path = os.path.join(folder, "sheet.jpg")
     cv2.imwrite(path, _sheet(rows))
     print(f"\nweather preview: {path} (single pictures full size next to it)")
+    if legend:
+        print(f"exact numbers for the WEATHER_LOOK / COMBOS rows: {os.path.join(folder, 'values.txt')}")
     return C.EXIT_DONE
