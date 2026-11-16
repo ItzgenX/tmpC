@@ -135,8 +135,11 @@ def _photo(session, cam):
 
 
 def _text(img, text, x, y, scale=0.6):
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 1, cv2.LINE_AA)
+    """White text on a solid black box - clearer than an outline against a busy photo."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, 1)
+    cv2.rectangle(img, (x - 4, y - th - 4), (x + tw + 4, y + baseline + 2), (0, 0, 0), -1)
+    cv2.putText(img, text, (x, y), font, scale, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def _sheet(rows):
@@ -233,7 +236,9 @@ def run_weather_preview(out):
                 print(f"  {line}")
             insight_sheets.append(("insights_combos.jpg", [("your COMBOS\n(edit in this file)", cells)]))
 
-        matrix_rows = []                     # all matrices stacked into ONE sheet, not one file each
+        # all matrices stacked into ONE sheet (insights_matrices.jpg) - no per-cell files,
+        # only that one combined image, so there is nothing separate to get confused by.
+        matrix_rows = []
         for mat_name, mat_rows in _matrix_rows():
             for row_name, cells in mat_rows:
                 rendered_cells = []
@@ -243,15 +248,13 @@ def run_weather_preview(out):
                         continue
                     _weather(session, values)
                     img = _photo(session, session.rgb)
-                    fname = f"matrix_{_slug(mat_name)}_{_slug(row_name)}_{_slug(title)}.jpg"
-                    cv2.imwrite(os.path.join(folder, fname), img)
                     rendered_cells.append((title, img))
-                    line = f"{fname}: {_values_label(values)}"
-                    legend.append(line)
-                    print(f"  {line}")
+                    legend.append(f"insights_matrices.jpg [{mat_name} / {row_name} / {title}]: "
+                                  f"{_values_label(values)}")
                 # first row of each matrix carries the matrix's own name too
                 label = f"{mat_name}\n{row_name}" if row_name.startswith("(rows:") else row_name
                 matrix_rows.append((label, rendered_cells))
+            print(f"  matrix '{mat_name}': done")
         if matrix_rows:
             insight_sheets.append(("insights_matrices.jpg", matrix_rows))
 
