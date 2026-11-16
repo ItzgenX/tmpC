@@ -1,29 +1,23 @@
 """python main.py --weather-preview: one picture sheet that shows what each weather setting does.
 
 Everything is on the same street view with people standing on the crossing. <out>/weather_preview/
-has just 2 kinds of thing in it:
+has 3 pictures to look at (same 0/25/50/75/100 = "% of the way across the range" language
+in all of them) plus one folder you normally don't need to open:
 
-  sheet.jpg / insights_*.jpg   - the pictures you actually look at, same 0/25/50/75/100 =
-                                  "% of the way across the range" language everywhere:
-                                    sheet.jpg               - single settings, one at a
-                                      time: each alone at 0/25/50/75/100 (sun high), then
-                                      the 4 rain settings combined, then
-                                      exposure_compensation.
-                                    insights_weather_look.jpg - your conditions from
-                                      advanced.py (clear / partly_cloudy / overcast / rain),
-                                      all their parameters combined, at 0% / 50% / 100%
-                                      of each one's configured range. This is what they
-                                      will actually look like.
-                                    insights_matrices.jpg   - 2 parameters together, one
-                                      per axis (edit the MATRICES list below), so you can
-                                      see how a pair interacts instead of guessing from
-                                      two separate single sweeps.
-  frames/                      - every individual photo behind the sheets above, full
-                                  size, named to match (e.g. frames/cloudiness_050.jpg).
-                                  You normally don't need to open this folder.
+  single_settings.jpg   - one setting at a time: each alone at 0/25/50/75/100 (sun high),
+                          then the 4 rain settings combined, then exposure_compensation.
+  weather_look_preview.jpg - your conditions from advanced.py (clear / partly_cloudy /
+                          overcast / rain), all their parameters combined, at 0% / 50% /
+                          100% of each one's configured range. This is what they will
+                          actually look like once used to generate the dataset.
+  parameter_pairs.jpg   - 2 parameters explored together, one per axis (edit the MATRICES
+                          list below), so you can see how a pair interacts instead of
+                          guessing from two separate single sweeps.
+  frames/               - every individual photo behind the 3 pictures above, full size,
+                          named to match (e.g. frames/cloudiness_050.jpg).
 
-The exact numbers behind every insights_*.jpg picture are printed to the console and
-written to <out>/weather_preview/values.txt.
+The exact numbers behind weather_look_preview.jpg and parameter_pairs.jpg are printed to
+the console and written to <out>/weather_preview/values.txt.
 Settings: https://carla.readthedocs.io/en/0.9.16/python_api/#carla.WeatherParameters
 """
 import os
@@ -213,14 +207,14 @@ def run_weather_preview(out):
                 fname = f"look_{cond}_{label}.jpg"
                 cv2.imwrite(os.path.join(frames, fname), img)
                 rendered.append((label, img))
-                line = f"insights_weather_look.jpg [{cond} {label}] (frames/{fname}): {_values_label(values)}"
+                line = f"weather_look_preview.jpg [{cond} {label}] (frames/{fname}): {_values_label(values)}"
                 legend.append(line)
                 print(f"  {line}")
             look_rows.append((f"WEATHER_LOOK\n{cond}", rendered))
         if look_rows:
-            insight_sheets.append(("insights_weather_look.jpg", look_rows))
+            insight_sheets.append(("weather_look_preview.jpg", look_rows))
 
-        # all matrices stacked into ONE sheet (insights_matrices.jpg) - no per-cell files,
+        # all matrices stacked into ONE sheet (parameter_pairs.jpg) - no per-cell files,
         # only that one combined image, so there is nothing separate to get confused by.
         matrix_rows = []
         for mat_name, mat_rows in _matrix_rows():
@@ -233,14 +227,14 @@ def run_weather_preview(out):
                     _weather(session, values)
                     img = _photo(session, session.rgb)
                     rendered_cells.append((title, img))
-                    legend.append(f"insights_matrices.jpg [{mat_name} / {row_name} / {title}]: "
+                    legend.append(f"parameter_pairs.jpg [{mat_name} / {row_name} / {title}]: "
                                   f"{_values_label(values)}")
                 # first row of each matrix carries the matrix's own name too
                 label = f"{mat_name}\n{row_name}" if row_name.startswith("(rows:") else row_name
                 matrix_rows.append((label, rendered_cells))
             print(f"  matrix '{mat_name}': done")
         if matrix_rows:
-            insight_sheets.append(("insights_matrices.jpg", matrix_rows))
+            insight_sheets.append(("parameter_pairs.jpg", matrix_rows))
 
         _weather(session, EXPOSURE_SKY)
         cells = []
@@ -266,13 +260,14 @@ def run_weather_preview(out):
         with open(os.path.join(folder, "values.txt"), "w") as f:
             f.write("\n".join(legend) + "\n")
 
-    path = os.path.join(folder, "sheet.jpg")
+    path = os.path.join(folder, "single_settings.jpg")
     cv2.imwrite(path, _sheet(rows))
     print(f"\nweather preview: {path} (individual photos are in {frames})")
     for fname, sheet_rows in insight_sheets:
         ipath = os.path.join(folder, fname)
         cv2.imwrite(ipath, _sheet(sheet_rows))
-        print(f"insight sheet: {ipath}")
+        print(f"weather preview: {ipath}")
     if legend:
-        print(f"exact numbers behind the insight sheets: {os.path.join(folder, 'values.txt')}")
+        print(f"exact numbers behind weather_look_preview.jpg / parameter_pairs.jpg: "
+              f"{os.path.join(folder, 'values.txt')}")
     return C.EXIT_DONE
