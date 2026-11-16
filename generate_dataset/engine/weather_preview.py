@@ -104,9 +104,10 @@ def _text(img, text, x, y, scale=0.6):
 def _sheet(rows):
     """rows: [(name, [(column title, image)])] -> one labelled grid image.
 
-    Rows can have different numbers of cells (e.g. 5 LEVELS vs 3 low/mid/high) - each
-    row's cells are stretched to fill the full row width, so a shorter row never leaves
-    blank space on the right.
+    Rows can have different numbers of cells (e.g. 5 LEVELS vs 3 low/mid/high). Every
+    cell keeps its native CELL_W x CELL_H (matches the images' real aspect ratio, so
+    nothing gets stretched/warped) - a shorter row is just centred in the row instead,
+    so the leftover space is split evenly either side rather than dumped as one block.
     """
     cols = max(len(cells) for _, cells in rows)
     width = LABEL_W + cols * CELL_W
@@ -116,11 +117,10 @@ def _sheet(rows):
         y = HEADER_H + r * CELL_H
         for i, line in enumerate(name.split("\n")):
             _text(sheet, line, 10, y + CELL_H // 2 + i * 24, 0.55)
-        cell_w = (width - LABEL_W) // len(cells)
+        row_start = LABEL_W + (width - LABEL_W - len(cells) * CELL_W) // 2
         for c, (title, img) in enumerate(cells):
-            x = LABEL_W + c * cell_w
-            w = width - x if c == len(cells) - 1 else cell_w   # last cell eats any rounding slack
-            sheet[y:y + CELL_H, x:x + w] = cv2.resize(img, (w, CELL_H), interpolation=cv2.INTER_AREA)
+            x = row_start + c * CELL_W
+            sheet[y:y + CELL_H, x:x + CELL_W] = cv2.resize(img, (CELL_W, CELL_H), interpolation=cv2.INTER_AREA)
             _text(sheet, title, x + 8, y + 26)
     return sheet
 
