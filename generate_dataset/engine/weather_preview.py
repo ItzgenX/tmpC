@@ -1,18 +1,25 @@
 """python main.py --weather-preview: one picture sheet that shows what each weather setting does.
 
-Four sections, all on the same street view with people standing on the crossing:
-  1. single settings  - each one alone, 0/25/50/75/100, everything else 0 (sun high).
-  2. WEATHER_LOOK      - your conditions from advanced.py, ALL their parameters combined,
-                         at the low / mid / high of each one's range. This is what
-                         clear / partly_cloudy / overcast / rain will actually look like.
-  3. COMBOS below      - your own hand-picked combinations, to test a specific mix before
-                         putting it in advanced.py.
-  4. MATRICES below    - two parameters together, one per axis (e.g. precipitation x
-                         wetness), everything else 0, so you can see how a pair interacts
-                         instead of guessing from two separate single-setting sweeps.
-The exact numbers behind every picture are printed to the console and written to
-<out>/weather_preview/values.txt, so you can read off exactly what produced a look you like.
-Saved to <out>/weather_preview/: sheet.jpg, plus every picture full size.
+Everything is on the same street view with people standing on the crossing, as two kinds
+of output, kept separate on purpose so each comparison is easy to read on its own:
+
+  sheet.jpg        - single settings only: each one alone, 0/25/50/75/100, everything
+                     else 0 (sun high), ending with the 4 settings combined ("rain: all 4
+                     + cloudiness") and exposure_compensation.
+  insights_*.jpg   - one small sheet per meaningful combination, not crammed together:
+                       insights_weather_look.jpg      - your conditions from advanced.py,
+                         all their parameters combined, at low/mid/high of each range.
+                         This is what clear / partly_cloudy / overcast / rain actually
+                         look like.
+                       insights_combos.jpg            - your own hand-picked mixes
+                         (edit the COMBOS list below) to test before touching advanced.py.
+                       insights_matrix_<name>.jpg     - two parameters together, one per
+                         axis (edit the MATRICES list below), so you can see how a pair
+                         interacts instead of guessing from two separate single sweeps.
+
+The exact numbers behind every insights_*.jpg picture are printed to the console and
+written to <out>/weather_preview/values.txt.
+Saved to <out>/weather_preview/: the sheets above, plus every picture full size.
 Settings: https://carla.readthedocs.io/en/0.9.16/python_api/#carla.WeatherParameters
 """
 import os
@@ -95,17 +102,19 @@ def _slug(s):
 
 
 def _matrix_rows():
-    """MATRICES -> a table per matrix: x-values as a header row on top (no photo), the
-    y-value as the row name on the left, one column per x-value, both params set together.
+    """MATRICES -> one (matrix name, rows) per matrix, each a standalone table: x-values
+    as a header row on top (no photo), the y-value as the row name on the left, one
+    column per x-value, both params set together.
     """
-    rows = []
+    out = []
     for name, xk, xs, yk, ys in MATRICES:
         header = [(f"{xk}={x:g}", None) for x in xs]          # None = text-only cell, no photo
-        rows.append((f"{name}\n(rows: {yk})", header))
+        rows = [(f"(rows: {yk})", header)]
         for y in ys:
             cells = [(f"{xk}={x:g}", {xk: x, yk: y}) for x in xs]
             rows.append((f"{yk}={y:g}", cells))
-    return rows
+        out.append((name, rows))
+    return out
 
 
 def _look_rows():
@@ -193,6 +202,9 @@ def run_weather_preview(out):
             rows.append((name, cells))
             print(f"  {name}: done")
 
+        insight_sheets = []                 # [(output filename, rows)] - one small sheet each
+
+        look_rows = []
         for cond, cells in _look_rows():
             rendered = []
             for label, values in cells:
@@ -204,7 +216,9 @@ def run_weather_preview(out):
                 line = f"{fname}: {_values_label(values)}"
                 legend.append(line)
                 print(f"  {line}")
-            rows.append((f"WEATHER_LOOK\n{cond}", rendered))
+            look_rows.append((f"WEATHER_LOOK\n{cond}", rendered))
+        if look_rows:
+            insight_sheets.append(("insights_weather_look.jpg", look_rows))
 
         if COMBOS:
             cells = []
@@ -217,23 +231,26 @@ def run_weather_preview(out):
                 line = f"{fname}: {_values_label(values)}"
                 legend.append(line)
                 print(f"  {line}")
-            rows.append(("your COMBOS\n(edit in this file)", cells))
+            insight_sheets.append(("insights_combos.jpg", [("your COMBOS\n(edit in this file)", cells)]))
 
-        for row_name, cells in _matrix_rows():
-            rendered = []
-            for title, values in cells:
-                if values is None:                              # header row: labels only
-                    rendered.append((title, None))
-                    continue
-                _weather(session, values)
-                img = _photo(session, session.rgb)
-                fname = f"matrix_{_slug(row_name)}_{_slug(title)}.jpg"
-                cv2.imwrite(os.path.join(folder, fname), img)
-                rendered.append((title, img))
-                line = f"{fname}: {_values_label(values)}"
-                legend.append(line)
-                print(f"  {line}")
-            rows.append((row_name, rendered))
+        for mat_name, mat_rows in _matrix_rows():
+            rendered_rows = []
+            for row_name, cells in mat_rows:
+                rendered_cells = []
+                for title, values in cells:
+                    if values is None:                          # header row: labels only
+                        rendered_cells.append((title, None))
+                        continue
+                    _weather(session, values)
+                    img = _photo(session, session.rgb)
+                    fname = f"matrix_{_slug(mat_name)}_{_slug(row_name)}_{_slug(title)}.jpg"
+                    cv2.imwrite(os.path.join(folder, fname), img)
+                    rendered_cells.append((title, img))
+                    line = f"{fname}: {_values_label(values)}"
+                    legend.append(line)
+                    print(f"  {line}")
+                rendered_rows.append((row_name, rendered_cells))
+            insight_sheets.append((f"insights_matrix_{_slug(mat_name)}.jpg", rendered_rows))
 
         _weather(session, EXPOSURE_SKY)
         cells = []
@@ -262,6 +279,10 @@ def run_weather_preview(out):
     path = os.path.join(folder, "sheet.jpg")
     cv2.imwrite(path, _sheet(rows))
     print(f"\nweather preview: {path} (single pictures full size next to it)")
+    for fname, sheet_rows in insight_sheets:
+        ipath = os.path.join(folder, fname)
+        cv2.imwrite(ipath, _sheet(sheet_rows))
+        print(f"insight sheet: {ipath}")
     if legend:
-        print(f"exact numbers for the WEATHER_LOOK / COMBOS rows: {os.path.join(folder, 'values.txt')}")
+        print(f"exact numbers behind the insight sheets: {os.path.join(folder, 'values.txt')}")
     return C.EXIT_DONE
