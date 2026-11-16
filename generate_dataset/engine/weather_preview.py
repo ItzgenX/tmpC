@@ -1,12 +1,15 @@
 """python main.py --weather-preview: one picture sheet that shows what each weather setting does.
 
-Three sections, all on the same street view with people standing on the crossing:
+Four sections, all on the same street view with people standing on the crossing:
   1. single settings  - each one alone, 0/25/50/75/100, everything else 0 (sun high).
-  2. WEATHER_LOOK      - your three conditions from advanced.py, ALL their parameters
-                         combined, at the low / mid / high of each one's range. This is
-                         what clear / partly_cloudy / overcast will actually look like.
+  2. WEATHER_LOOK      - your conditions from advanced.py, ALL their parameters combined,
+                         at the low / mid / high of each one's range. This is what
+                         clear / partly_cloudy / overcast / rain will actually look like.
   3. COMBOS below      - your own hand-picked combinations, to test a specific mix before
                          putting it in advanced.py.
+  4. MATRICES below    - two parameters together, one per axis (e.g. precipitation x
+                         wetness), everything else 0, so you can see how a pair interacts
+                         instead of guessing from two separate single-setting sweeps.
 The exact numbers behind every picture are printed to the console and written to
 <out>/weather_preview/values.txt, so you can read off exactly what produced a look you like.
 Saved to <out>/weather_preview/: sheet.jpg, plus every picture full size.
@@ -45,6 +48,14 @@ COMBOS = [
     ("drizzle",        {"cloudiness": 70, "precipitation": 30, "precipitation_deposits": 20,
                          "wetness": 30, "wind_intensity": 15}),
 ]
+# --- x/y grids: see two parameters TOGETHER, one on each axis, everything else 0 ---
+# (name, x param, x values, y param, y values) - edit freely, pick any two WEATHER_KEYS.
+# e.g. this answers "what does wetness + precipitation together actually look like", which
+# a single-parameter sweep can't show since wetness alone barely changes anything visually.
+MATRICES = [
+    ("precipitation x wetness", "precipitation", (0, 50, 100), "wetness", (0, 50, 100)),
+    ("cloudiness x fog_density", "cloudiness", (0, 50, 100), "fog_density", (0, 10, 30)),
+]
 SUN = {"sun_altitude_angle": 70.0, "sun_azimuth_angle": 45.0}
 # camera brightness: 0 = as measured, -1 = 2x darker, +1 = 2x brighter (CARLA's Linux default is -1.5)
 # https://carla.readthedocs.io/en/0.9.16/ref_sensors/#rgb-camera
@@ -77,6 +88,24 @@ def _weather(session, values):
 
 def _values_label(values):
     return " ".join(f"{k}={v:g}" for k, v in sorted(values.items()))
+
+
+def _slug(s):
+    return "".join(c if c.isalnum() else "_" for c in s).strip("_")
+
+
+def _matrix_rows():
+    """MATRICES -> a table per matrix: x-values as a header row on top (no photo), the
+    y-value as the row name on the left, one column per x-value, both params set together.
+    """
+    rows = []
+    for name, xk, xs, yk, ys in MATRICES:
+        header = [(f"{xk}={x:g}", None) for x in xs]          # None = text-only cell, no photo
+        rows.append((f"{name}\n(rows: {yk})", header))
+        for y in ys:
+            cells = [(f"{xk}={x:g}", {xk: x, yk: y}) for x in xs]
+            rows.append((f"{yk}={y:g}", cells))
+    return rows
 
 
 def _look_rows():
@@ -120,8 +149,12 @@ def _sheet(rows):
         row_start = LABEL_W + (width - LABEL_W - len(cells) * CELL_W) // 2
         for c, (title, img) in enumerate(cells):
             x = row_start + c * CELL_W
-            sheet[y:y + CELL_H, x:x + CELL_W] = cv2.resize(img, (CELL_W, CELL_H), interpolation=cv2.INTER_AREA)
-            _text(sheet, title, x + 8, y + 26)
+            if img is None:                                    # header cell: label only, no photo
+                sheet[y:y + CELL_H, x:x + CELL_W] = 55
+                _text(sheet, title, x + 8, y + CELL_H // 2, 0.7)
+            else:
+                sheet[y:y + CELL_H, x:x + CELL_W] = cv2.resize(img, (CELL_W, CELL_H), interpolation=cv2.INTER_AREA)
+                _text(sheet, title, x + 8, y + 26)
     return sheet
 
 
@@ -185,6 +218,22 @@ def run_weather_preview(out):
                 legend.append(line)
                 print(f"  {line}")
             rows.append(("your COMBOS\n(edit in this file)", cells))
+
+        for row_name, cells in _matrix_rows():
+            rendered = []
+            for title, values in cells:
+                if values is None:                              # header row: labels only
+                    rendered.append((title, None))
+                    continue
+                _weather(session, values)
+                img = _photo(session, session.rgb)
+                fname = f"matrix_{_slug(row_name)}_{_slug(title)}.jpg"
+                cv2.imwrite(os.path.join(folder, fname), img)
+                rendered.append((title, img))
+                line = f"{fname}: {_values_label(values)}"
+                legend.append(line)
+                print(f"  {line}")
+            rows.append((row_name, rendered))
 
         _weather(session, EXPOSURE_SKY)
         cells = []
