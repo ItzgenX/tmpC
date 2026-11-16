@@ -1,25 +1,29 @@
 """python main.py --weather-preview: one picture sheet that shows what each weather setting does.
 
-Everything is on the same street view with people standing on the crossing, as two kinds
-of output, kept separate on purpose so each comparison is easy to read on its own:
+Everything is on the same street view with people standing on the crossing. <out>/weather_preview/
+has just 2 kinds of thing in it:
 
-  sheet.jpg        - single settings only: each one alone, 0/25/50/75/100, everything
-                     else 0 (sun high), ending with the 4 settings combined ("rain: all 4
-                     + cloudiness") and exposure_compensation.
-  insights_*.jpg   - one small sheet per meaningful combination, not crammed together:
-                       insights_weather_look.jpg      - your conditions from advanced.py,
-                         all their parameters combined, at low/mid/high of each range.
-                         This is what clear / partly_cloudy / overcast / rain actually
-                         look like.
-                       insights_combos.jpg            - your own hand-picked mixes
-                         (edit the COMBOS list below) to test before touching advanced.py.
-                       insights_matrix_<name>.jpg     - two parameters together, one per
-                         axis (edit the MATRICES list below), so you can see how a pair
-                         interacts instead of guessing from two separate single sweeps.
+  sheet.jpg / insights_*.jpg   - the pictures you actually look at, same 0/25/50/75/100 =
+                                  "% of the way across the range" language everywhere:
+                                    sheet.jpg               - single settings, one at a
+                                      time: each alone at 0/25/50/75/100 (sun high), then
+                                      the 4 rain settings combined, then
+                                      exposure_compensation.
+                                    insights_weather_look.jpg - your conditions from
+                                      advanced.py (clear / partly_cloudy / overcast / rain),
+                                      all their parameters combined, at 0% / 50% / 100%
+                                      of each one's configured range. This is what they
+                                      will actually look like.
+                                    insights_matrices.jpg   - 2 parameters together, one
+                                      per axis (edit the MATRICES list below), so you can
+                                      see how a pair interacts instead of guessing from
+                                      two separate single sweeps.
+  frames/                      - every individual photo behind the sheets above, full
+                                  size, named to match (e.g. frames/cloudiness_050.jpg).
+                                  You normally don't need to open this folder.
 
 The exact numbers behind every insights_*.jpg picture are printed to the console and
 written to <out>/weather_preview/values.txt.
-Saved to <out>/weather_preview/: the sheets above, plus every picture full size.
 Settings: https://carla.readthedocs.io/en/0.9.16/python_api/#carla.WeatherParameters
 """
 import os
@@ -45,16 +49,8 @@ ROWS = [                                    # (row name, settings set to the lev
     ("rain: all 4\n+ cloudiness", ["cloudiness", "precipitation", "precipitation_deposits", "wetness"]),
 ]
 WEATHER_KEYS = ("cloudiness", "precipitation", "precipitation_deposits", "wind_intensity", "fog_density", "wetness")
-LOOK_POINTS = (0.0, 0.5, 1.0)                # fraction of each WEATHER_LOOK range: low / mid / high
-LOOK_LABELS = ("low", "mid", "high")
-# --- your own test mixes: edit freely, each one renders as one picture ---
-# values left out default to 0. try a guess here before writing it into advanced.WEATHER_LOOK.
-COMBOS = [
-    ("light haze",     {"cloudiness": 20, "fog_density": 5, "wind_intensity": 10}),
-    ("heavy overcast", {"cloudiness": 95, "fog_density": 6, "wind_intensity": 25}),
-    ("drizzle",        {"cloudiness": 70, "precipitation": 30, "precipitation_deposits": 20,
-                         "wetness": 30, "wind_intensity": 15}),
-]
+LOOK_POINTS = (0.0, 0.5, 1.0)                # fraction of each WEATHER_LOOK range
+LOOK_LABELS = tuple(f"{int(t * 100)}%" for t in LOOK_POINTS)   # 0% / 50% / 100% of that range
 # --- x/y grids: see two parameters TOGETHER, one on each axis, everything else 0 ---
 # (name, x param, x values, y param, y values) - edit freely, pick any two WEATHER_KEYS.
 # e.g. this answers "what does wetness + precipitation together actually look like", which
@@ -118,7 +114,7 @@ def _matrix_rows():
 
 
 def _look_rows():
-    """advanced.WEATHER_LOOK, every parameter in a condition combined, at low/mid/high of its range."""
+    """advanced.WEATHER_LOOK, every parameter in a condition combined, at 0%/50%/100% of its range."""
     rows = []
     for cond, ranges in C.WEATHER_LOOK.items():
         cells = []
@@ -145,7 +141,7 @@ def _text(img, text, x, y, scale=0.6):
 def _sheet(rows):
     """rows: [(name, [(column title, image)])] -> one labelled grid image.
 
-    Rows can have different numbers of cells (e.g. 5 LEVELS vs 3 low/mid/high). Every
+    Rows can have different numbers of cells (e.g. 5 LEVELS vs 3 LOOK_POINTS). Every
     cell keeps its native CELL_W x CELL_H (matches the images' real aspect ratio, so
     nothing gets stretched/warped) - a shorter row is just centred in the row instead,
     so the leftover space is split evenly either side rather than dumped as one block.
@@ -180,7 +176,8 @@ def run_weather_preview(out):
         print("none of the maps in MAPS is on this server (see python main.py --check)")
         return C.EXIT_FATAL
     folder = os.path.join(out, "weather_preview")
-    os.makedirs(folder, exist_ok=True)
+    frames = os.path.join(folder, "frames")       # every individual photo lives here
+    os.makedirs(frames, exist_ok=True)
 
     session, actors, rows, legend = MapSession(client, carla, *maps[0]), [], [], []
     try:
@@ -200,7 +197,7 @@ def run_weather_preview(out):
             for v in LEVELS:
                 _weather(session, {k: v for k in keys})
                 img = _photo(session, session.rgb)
-                cv2.imwrite(os.path.join(folder, f"{name.split(':')[0]}_{v:03d}.jpg"), img)
+                cv2.imwrite(os.path.join(frames, f"{name.split(':')[0]}_{v:03d}.jpg"), img)
                 cells.append((f"{v}", img))
             rows.append((name, cells))
             print(f"  {name}: done")
@@ -214,27 +211,14 @@ def run_weather_preview(out):
                 _weather(session, values)
                 img = _photo(session, session.rgb)
                 fname = f"look_{cond}_{label}.jpg"
-                cv2.imwrite(os.path.join(folder, fname), img)
+                cv2.imwrite(os.path.join(frames, fname), img)
                 rendered.append((label, img))
-                line = f"{fname}: {_values_label(values)}"
+                line = f"insights_weather_look.jpg [{cond} {label}] (frames/{fname}): {_values_label(values)}"
                 legend.append(line)
                 print(f"  {line}")
             look_rows.append((f"WEATHER_LOOK\n{cond}", rendered))
         if look_rows:
             insight_sheets.append(("insights_weather_look.jpg", look_rows))
-
-        if COMBOS:
-            cells = []
-            for name, values in COMBOS:
-                _weather(session, values)
-                img = _photo(session, session.rgb)
-                fname = f"combo_{name.replace(' ', '_')}.jpg"
-                cv2.imwrite(os.path.join(folder, fname), img)
-                cells.append((name, img))
-                line = f"{fname}: {_values_label(values)}"
-                legend.append(line)
-                print(f"  {line}")
-            insight_sheets.append(("insights_combos.jpg", [("your COMBOS\n(edit in this file)", cells)]))
 
         # all matrices stacked into ONE sheet (insights_matrices.jpg) - no per-cell files,
         # only that one combined image, so there is nothing separate to get confused by.
@@ -270,7 +254,7 @@ def run_weather_preview(out):
                 img = _photo(session, cam)
             finally:
                 destroy_actors(session.client, session.world, [cam])
-            cv2.imwrite(os.path.join(folder, f"exposure_{e:+.1f}.jpg"), img)
+            cv2.imwrite(os.path.join(frames, f"exposure_{e:+.1f}.jpg"), img)
             cells.append((f"{e:+.1f}", img))
         rows.append(("exposure_compensation\n(at cloudiness 90)", cells))
     finally:
@@ -284,7 +268,7 @@ def run_weather_preview(out):
 
     path = os.path.join(folder, "sheet.jpg")
     cv2.imwrite(path, _sheet(rows))
-    print(f"\nweather preview: {path} (single pictures full size next to it)")
+    print(f"\nweather preview: {path} (individual photos are in {frames})")
     for fname, sheet_rows in insight_sheets:
         ipath = os.path.join(folder, fname)
         cv2.imwrite(ipath, _sheet(sheet_rows))
