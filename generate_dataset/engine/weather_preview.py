@@ -102,17 +102,25 @@ def _text(img, text, x, y, scale=0.6):
 
 
 def _sheet(rows):
-    """rows: [(name, [(column title, image)])] -> one labelled grid image."""
+    """rows: [(name, [(column title, image)])] -> one labelled grid image.
+
+    Rows can have different numbers of cells (e.g. 5 LEVELS vs 3 low/mid/high) - each
+    row's cells are stretched to fill the full row width, so a shorter row never leaves
+    blank space on the right.
+    """
     cols = max(len(cells) for _, cells in rows)
-    sheet = np.full((HEADER_H + len(rows) * CELL_H, LABEL_W + cols * CELL_W, 3), 40, np.uint8)
+    width = LABEL_W + cols * CELL_W
+    sheet = np.full((HEADER_H + len(rows) * CELL_H, width, 3), 40, np.uint8)
     _text(sheet, "setting  \\  value", 10, 28)
     for r, (name, cells) in enumerate(rows):
         y = HEADER_H + r * CELL_H
         for i, line in enumerate(name.split("\n")):
             _text(sheet, line, 10, y + CELL_H // 2 + i * 24, 0.55)
+        cell_w = (width - LABEL_W) // len(cells)
         for c, (title, img) in enumerate(cells):
-            x = LABEL_W + c * CELL_W
-            sheet[y:y + CELL_H, x:x + CELL_W] = cv2.resize(img, (CELL_W, CELL_H), interpolation=cv2.INTER_AREA)
+            x = LABEL_W + c * cell_w
+            w = width - x if c == len(cells) - 1 else cell_w   # last cell eats any rounding slack
+            sheet[y:y + CELL_H, x:x + w] = cv2.resize(img, (w, CELL_H), interpolation=cv2.INTER_AREA)
             _text(sheet, title, x + 8, y + 26)
     return sheet
 
