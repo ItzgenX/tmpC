@@ -233,8 +233,8 @@ def run_weather_preview(out):
                 print(f"  {line}")
             insight_sheets.append(("insights_combos.jpg", [("your COMBOS\n(edit in this file)", cells)]))
 
+        matrix_rows = []                     # all matrices stacked into ONE sheet, not one file each
         for mat_name, mat_rows in _matrix_rows():
-            rendered_rows = []
             for row_name, cells in mat_rows:
                 rendered_cells = []
                 for title, values in cells:
@@ -249,8 +249,11 @@ def run_weather_preview(out):
                     line = f"{fname}: {_values_label(values)}"
                     legend.append(line)
                     print(f"  {line}")
-                rendered_rows.append((row_name, rendered_cells))
-            insight_sheets.append((f"insights_matrix_{_slug(mat_name)}.jpg", rendered_rows))
+                # first row of each matrix carries the matrix's own name too
+                label = f"{mat_name}\n{row_name}" if row_name.startswith("(rows:") else row_name
+                matrix_rows.append((label, rendered_cells))
+        if matrix_rows:
+            insight_sheets.append(("insights_matrices.jpg", matrix_rows))
 
         _weather(session, EXPOSURE_SKY)
         cells = []
